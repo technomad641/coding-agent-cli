@@ -47,18 +47,54 @@ gate, a result, a summary.*
 
 ```mermaid
 flowchart TD
-    U["You, in the terminal"] -->|"types a task"| REPL["REPL loop\n(src/index.ts)"]
-    REPL -->|"messages + tool defs"| API["Anthropic Messages API\n(claude-opus-5, streamed)"]
-    API -->|"stop_reason: tool_use"| Dispatch{"which tool?"}
-    Dispatch -->|"bash"| Bash["handleBash()\n(src/tools.ts)"]
-    Dispatch -->|"str_replace_based_edit_tool"| Editor["handleTextEditor()\n(src/tools.ts)"]
-    Bash -->|"y/n approval gate"| Shell["child_process.exec\n(cwd = project root)"]
-    Editor -->|"path confinement check"| FS["fs read/write\n(project root only)"]
+    subgraph Local["your machine"]
+        U(["You, in the terminal"])
+        REPL["REPL loop\nsrc/index.ts"]
+        Dispatch{"which tool?"}
+        Bash["handleBash()\nsrc/tools.ts"]
+        Editor["handleTextEditor()\nsrc/tools.ts"]
+        Shell[("child_process.exec\ncwd = project root")]
+        FS[("fs read/write\nproject root only")]
+    end
+
+    subgraph Remote["Anthropic's servers"]
+        API["Messages API\nclaude-opus-5, streamed"]
+    end
+
+    U -->|"types a task"| REPL
+    REPL -->|"messages + tool defs"| API
+    API -->|"stop_reason: tool_use"| Dispatch
+    Dispatch -->|"bash"| Bash
+    Dispatch -->|"str_replace_based_edit_tool"| Editor
+    Bash -->|"① y/n approval gate"| Shell
+    Editor -->|"② path confinement check"| FS
     Shell -->|"tool_result"| REPL
     FS -->|"tool_result"| REPL
     REPL -->|"loop until stop_reason: end_turn"| API
     API -->|"stop_reason: end_turn"| U
+
+    classDef guarded fill:#4d2d00,stroke:#d29922,color:#ffe7b3,stroke-width:2px
+    class Bash,Editor guarded
 ```
+
+Reading it:
+
+- **The box around each half is the trust boundary**, not just visual
+  grouping - it's the same "your repos vs. the model's servers" split the
+  [Threat model](#threat-model) section is built around.
+- **The two highlighted nodes (① ②) are the ones with a safety check in
+  front of them** - `handleBash` behind the approval prompt, `handleTextEditor`
+  behind the path-confinement check. Every other node runs unconditionally.
+- **Cylinders are external resources being touched** (your shell, your
+  filesystem); rectangles are pure code; the diamond is the one branch
+  point in the whole system.
+- GitHub renders this as a pan/zoom-able SVG natively (drag to move, scroll
+  or pinch to zoom) - no extra tooling needed to read the detail. Node
+  labels deliberately aren't click-through links to the source files:
+  GitHub's Mermaid renderer currently blocks that (`click` either gets
+  flagged as blocked content or 404s on a relative path, since the diagram
+  renders inside a sandboxed iframe) - the file table right below does that
+  job instead, reliably.
 
 The whole system is two files:
 
@@ -71,6 +107,42 @@ There's no third layer. No planner, no memory store, no vector index, no
 sub-agents. The conversation array *is* the state.
 
 ## How the loop actually works
+
+The diagram above shows the pieces; this shows the same system over time -
+one full turn, including the approval interrupt sitting in the middle of it:
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant CLI as REPL (src/index.ts)
+    participant Claude as Messages API
+    participant Tool as bash / text-editor handler
+
+    You->>CLI: type a task
+    CLI->>Claude: messages + tool defs (streamed)
+
+    loop until stop_reason = end_turn
+        Claude-->>CLI: text delta (streamed to terminal)
+        Claude->>CLI: tool_use block
+
+        opt tool is bash
+            CLI->>You: run: npm test - allow? [y/N]
+            You-->>CLI: y / N
+        end
+
+        CLI->>Tool: execute (path-confined / approval-gated)
+        Tool-->>CLI: tool_result
+        CLI->>Claude: tool_result appended to messages
+    end
+
+    Claude-->>CLI: final text, stop_reason: end_turn
+    CLI-->>You: prints summary, waits for next task
+```
+
+Note the `opt` block: the approval prompt only happens for `bash` calls, and
+it's a genuine round-trip to a human sitting inside the loop - the API call
+that started the turn doesn't resume until you answer it. Everything else
+in that `loop` runs unattended.
 
 Stripped to its essence, `runTurn()` in `src/index.ts` does this:
 
