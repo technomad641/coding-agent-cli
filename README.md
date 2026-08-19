@@ -12,6 +12,16 @@ one question honestly: strip away the framework, the polish, and the
 managed infrastructure - what's actually left? The answer turns out to be
 small enough to read in one sitting, which is the whole point.
 
+## Demo
+
+![coding-agent-cli terminal session: the user asks it to add a .gitignore, it calls the text-editor tool to create one, then the user asks it to run the tests, it asks for y/n approval before running npm test via the bash tool, and reports the result](./docs/demo.gif)
+
+*This is a scripted re-creation of the exact transcript in the [Usage](#usage)
+section below, drawn frame-by-frame with [`scripts/make_demo_gif.py`](./scripts/make_demo_gif.py)
+- not a screen recording. It's here so the shape of a session is obvious
+before you read a line of code: a task in, a tool call with an approval
+gate, a result, a summary.*
+
 ## Why this exists
 
 Every AI coding tool you've used is some variation of the same primitive
@@ -86,79 +96,99 @@ handling beyond the tool-use path:
 - **`refusal`** - the model declined on policy grounds; `stop_details.category` says why.
 - **`max_tokens`** - the response got cut off by the `MAX_TOKENS` cap; the CLI tells you so instead of silently truncating.
 
-## The tools
+## Tools this harness supports
 
-Both tools are Anthropic-defined, not custom ones we wrote a JSON Schema
-for. That's a deliberate choice: `bash_20250124` and `text_editor_20250728`
-are schema-less - the model already knows their input shape from training,
-so the tool definition is just `{ type, name }` with no `input_schema`.
-Claude also has years of practice using exactly these two tool shapes,
-because they're the same ones Claude Code itself exposes - which matters
-more than it sounds like for behavior quality.
+Just two - both **Anthropic-defined tools**, not custom ones with a
+hand-written JSON Schema. That's the first design decision worth
+explaining:
 
-- **`bash`** (`handleBash`) - runs one command via `child_process.exec` with
+- **Why Anthropic-defined, not custom-schema.** `bash_20250124` and
+  `text_editor_20250728` are schema-less - the tool definition is just
+  `{ type, name }`, no `input_schema` at all, because the model already
+  knows the input shape from training.
+- **Why *these specific* two, and not more.** They're the minimum pair
+  needed to make "read code, run code, edit code" possible at all. A
+  narrower custom tool (`run_tests`, `git_commit`, `lint_file`) would just
+  be shell in a smaller costume; a broader one (an MCP client, a
+  `git_commit` tool with its own message-formatting rules) is scope creep
+  for a project whose stated goal is *understand the loop*, not *cover
+  every workflow*. See [Known limitations](#known-limitations-non-goals-not-oversights).
+- **Why it matters that they're the *same* tools Claude Code exposes.**
+  Claude has substantially more real-world practice with exactly these two
+  tool shapes than with an equivalent custom one - measurably better
+  behavior for free, not just less code to write.
+
+### `bash` (`bash_20250124`)
+
+- **What it does:** runs one shell command via `child_process.exec`, with
   `cwd` pinned to the project root, a 120s timeout, and a 10MB output cap.
-  Combined stdout+stderr goes back as the tool result, including on
-  failure - a non-zero exit isn't an exception the loop has to catch, it's
-  just text the model reads and reacts to, same as a human would reading a
-  terminal.
-- **`str_replace_based_edit_tool`** (`handleTextEditor`) - implements the
-  four commands Claude can issue: `view` (read a file or a line range),
+- **Why bash and not a narrower tool:** real coding tasks need arbitrary
+  shell access - installing a dependency, running whatever the project's
+  test runner happens to be, `grep`, `git status`. Restricting that to a
+  fixed menu of pre-approved actions would make the tool useless for
+  anything the menu didn't anticipate.
+- **What comes back:** combined stdout+stderr, always, success or failure.
+  A non-zero exit isn't an exception the loop has to catch - it's just text
+  the model reads and reacts to, the same way you'd read a red terminal.
+- **The guardrail:** every command requires an interactive `y`/`N` before
+  it runs (see [Threat model](#threat-model)).
+
+### `str_replace_based_edit_tool` (`text_editor_20250728`)
+
+- **What it does:** four commands - `view` (read a file or a line range),
   `create` (write a new file, backing up an existing one to `.bak` first),
-  `str_replace` (swap one exact, unique substring - it deliberately errors
-  if `old_str` matches zero or more than once, rather than guessing), and
-  `insert` (add a line after a given line number).
+  `str_replace` (swap one exact, unique substring), `insert` (add a line
+  after a given line number).
+- **Why `str_replace` specifically, over just handing the model raw
+  `fs.writeFile`:** it forces the model to express an edit as an
+  old-string/new-string pair instead of silently rewriting a whole file. If
+  `old_str` matches zero times or more than once, the tool hard-fails
+  instead of guessing which occurrence was meant - a smaller, more
+  reviewable diff surface than "here's the new file contents, trust me."
+- **The guardrail:** every path is resolved and confined to the project
+  root before any filesystem call runs (see [Threat model](#threat-model)).
 
 ## Threat model
 
-Worth being explicit about this rather than hand-wavy, since the entire
-point of this tool is that a language model is generating commands and file
-paths that your machine then executes:
+The model generates commands and file paths; this process is what actually
+executes them. That's the entire risk surface. In bullets, not paragraphs:
 
-**What's treated as untrusted input:** every `path` and every shell
-`command` in a `tool_use` block. The model's output is not sanitized
-upstream by Anthropic in any way that this codebase relies on - it's plain
-text this process chooses to act on.
+**Treated as untrusted input**
+- Every `path` in a `tool_use` block.
+- Every shell `command` in a `tool_use` block.
+- Nothing upstream sanitizes either before this code sees them.
 
-**What's mitigated, and how:**
-- *Path traversal / symlink escape* - `resolveWithinRoot()` in
-  `src/tools.ts` resolves the model-supplied path against the project root,
-  rejects anything that lands outside it (`..`, an absolute path elsewhere
-  on disk), and additionally resolves symlinks on the nearest existing
-  ancestor so a symlink planted inside the root that points outside it is
-  still caught. Every file operation goes through this - there's no code
-  path that calls `fs.*` on a raw model-supplied string.
-- *Unattended shell execution* - every bash command is echoed to the
-  terminal and requires an explicit `y` before it runs. This is the
-  primary control, not a backstop.
+**Mitigated, and how**
+- *Path traversal / symlink escape* → `resolveWithinRoot()` in
+  `src/tools.ts` resolves the model's path against the project root and
+  rejects anything that escapes it (`..`, an absolute path elsewhere on
+  disk), including resolving symlinks on the nearest existing ancestor so a
+  symlink planted inside the root can't point outside it.
+- *No file op bypasses the check* - there's no code path that calls `fs.*`
+  on a raw model-supplied string.
+- *Unattended shell execution* → every bash command is printed and
+  requires an explicit `y` before it runs. This is the primary control,
+  not a backstop.
 
-**What's explicitly *not* mitigated, on purpose:**
-- *Command allowlisting.* There isn't one. A tool that blocked pipes,
-  `&&`, backticks, or arbitrary binaries would also block most of what
-  makes a shell tool useful for real coding tasks (`grep | wc -l`,
-  `npm test && npm run build`, and so on). The y/n gate exists precisely
-  *because* the command surface is unrestricted - if you automate approval
-  (`AUTO_APPROVE_BASH=true`), you are personally taking on the role the
-  allowlist would otherwise play. Do that only in a directory you'd hand
-  root-in-that-directory access to.
-- *Sandboxing.* No container, no VM, no seccomp profile, no filesystem
-  overlay. `bash` runs with your actual user's permissions in your actual
-  shell environment. The path confinement stops the *editor* tool from
-  reaching outside the project root; it does nothing to stop a bash command
-  you approve from doing so - `rm -rf ../something` is a normal shell
-  command, and the approval prompt is the only thing standing between the
-  model suggesting it and it running.
-- *Prompt injection via tool output.* If a file the model reads (via
-  `view`) or a command's output contains text engineered to look like new
-  instructions, nothing here distinguishes "content the model is looking
-  at" from "instructions the model should follow" - because the model
-  itself doesn't reliably distinguish that either. This is a known open
-  problem across the entire industry, not something a 230-line harness
-  solves; be aware of it before pointing this at untrusted files.
-
-If you're building past this project, `shared/agent-design.md` and
-`shared/tool-use-concepts.md` in Anthropic's own docs are worth reading
-before you loosen any of the above.
+**Not mitigated - on purpose**
+- *No command allowlist.* Blocking pipes, `&&`, backticks, or arbitrary
+  binaries would also block most of what makes a shell tool useful
+  (`grep | wc -l`, `npm test && npm run build`). The y/n gate exists
+  *because* the command surface is unrestricted.
+- *`AUTO_APPROVE_BASH=true` removes that gate entirely.* If you set it,
+  you are personally taking on the role the allowlist would otherwise
+  play - only do this in a directory you'd hand unattended shell access to.
+- *No sandboxing.* No container, no VM, no seccomp profile. `bash` runs
+  with your real user's permissions in your real shell environment. Path
+  confinement only covers the *editor* tool - an approved bash command can
+  still run `rm -rf ../something`, because that's a completely ordinary
+  shell command from bash's point of view.
+- *No prompt-injection defense.* If a file the model reads, or a command's
+  output, contains text engineered to look like new instructions, nothing
+  here distinguishes "content the model is looking at" from "instructions
+  the model should follow" - because the model itself doesn't reliably
+  distinguish that either. Open problem industry-wide, not something a
+  230-line harness solves.
 
 ## Where this sits relative to the "real" options
 
@@ -220,6 +250,8 @@ Tests are passing - no changes needed.
 > exit
 ```
 
+(This is also what [`docs/demo.gif`](./docs/demo.gif) shows, animated - see [Demo](#demo) above.)
+
 It operates on whatever directory you launched `npm start` from - that
 directory *is* the project it can see and edit, for the reasons in the
 threat model above. Point it at a disposable test folder the first time you
@@ -232,17 +264,21 @@ run it, not something you'd mind losing.
 | `ANTHROPIC_API_KEY` | *(required)* | Your Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com/settings/keys). |
 | `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. |
 | `MAX_TOKENS` | `8192` | Per-response token ceiling. Raised responses cost more and take longer to stream; lowered ones risk mid-thought truncation (the CLI will tell you when this happens). |
-| `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See the threat model section before touching this. |
+| `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
 
 ## Project layout
 
 ```
 coding-agent-cli/
 ├── src/
-│   ├── index.ts      # REPL + the agentic loop
-│   └── tools.ts       # bash + text-editor handlers, path confinement
+│   ├── index.ts            # REPL + the agentic loop
+│   └── tools.ts              # bash + text-editor handlers, path confinement
+├── docs/
+│   └── demo.gif                # the animated session in the Demo section
+├── scripts/
+│   └── make_demo_gif.py          # regenerates docs/demo.gif (pip install pillow)
 ├── package.json
-├── tsconfig.json      # strict mode, noUncheckedIndexedAccess
+├── tsconfig.json                   # strict mode, noUncheckedIndexedAccess
 ├── .env.example
 └── README.md
 ```
