@@ -24,20 +24,24 @@ gate, a result, a summary.*
 
 ## Why this exists
 
-Every AI coding tool you've used is some variation of the same primitive
-loop: send the model a conversation and a list of tools it's allowed to
-call; if it asks to call one, run it and hand back the result; repeat until
-it stops asking. Frameworks (LangChain-style agent runtimes, the Claude
-Agent SDK, Anthropic's own beta Tool Runner) exist to make that loop
-convenient - retries, streaming ergonomics, context management, built-in
-tool implementations. Convenient is good in production, but it also means
-the loop itself is invisible by the time you're using any of those.
-
-This repo goes the other direction on purpose: no `tool_runner`, no agent
-SDK, no hidden retry logic. `src/index.ts` *is* the loop, and there is
-nowhere else for the control flow to be. If you've ever wondered what
-Claude Code is actually doing between you pressing enter and a file
-changing on disk, this is that, minus years of hardening.
+- Every AI coding tool you've used is some variation of the same primitive
+  loop: send the model a conversation and a list of tools it's allowed to
+  call.
+- If it asks to call one, run it and hand the result back; repeat until it
+  stops asking.
+- Frameworks exist to make that loop convenient - LangChain-style agent
+  runtimes, the Claude Agent SDK, Anthropic's own beta Tool Runner - adding
+  retries, streaming ergonomics, context management, built-in tool
+  implementations.
+- Convenient is the right call in production, but it also means the loop
+  itself is invisible by the time you're using any of those.
+- This repo goes the other direction on purpose: no `tool_runner`, no
+  agent SDK, no hidden retry logic.
+- `src/index.ts` *is* the loop - there's nowhere else for the control flow
+  to hide.
+- If you've ever wondered what Claude Code is actually doing between you
+  pressing enter and a file changing on disk: this is that, minus years of
+  hardening.
 
 ## Architecture
 
