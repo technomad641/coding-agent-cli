@@ -45,7 +45,7 @@ font = ImageFont.truetype(FONT_PATH, FONT_SIZE * SCALE)
 # behaviors of the actual CLI (readline input vs. token streaming), not
 # arbitrary animation choices.
 LINES = [
-    ("$ npm start", FG_DIM, 3, 18, 150),
+    ("$ python main.py", FG_DIM, 3, 18, 150),
     ("coding-agent-cli - basic coding harness (claude-opus-5)", FG_DIM, 6, 12, 60),
     ("project root: ~/scratch/test-project", FG_DIM, 6, 12, 60),
     ('type a task, or "exit" to quit', FG_DIM, 6, 12, 400),
