@@ -58,6 +58,7 @@ flowchart TD
         Editor["handle_text_editor()\ntools.py"]
         Shell[("subprocess.run\ncwd = project root")]
         FS[("pathlib read/write\nproject root only")]
+        Logs[("logs/events.jsonl")]
     end
 
     subgraph Remote["Anthropic's servers"]
@@ -75,6 +76,7 @@ flowchart TD
     FS -->|"tool_result"| REPL
     REPL -->|"loop until stop_reason: end_turn"| API
     API -->|"stop_reason: end_turn"| U
+    REPL -.->|"structured events"| Logs
 
     classDef guarded fill:#4d2d00,stroke:#d29922,color:#ffe7b3,stroke-width:2px
     class Bash,Editor guarded
@@ -99,6 +101,10 @@ Reading it:
   flagged as blocked content or 404s on a relative path, since the diagram
   renders inside a sandboxed iframe) - the file table right below does that
   job instead, reliably.
+- **The dotted edge is a side-channel, not the main request loop** - as the
+  REPL runs, it also writes a structured event to `logs/events.jsonl`;
+  that's a fire-and-forget write, not something anything downstream reads
+  back. See [Observability](#observability).
 
 The whole system is two files:
 
@@ -272,6 +278,12 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   the model should follow" - because the model itself doesn't reliably
   distinguish that either. Open problem industry-wide, not something a
   400-line harness solves.
+- *Tool output now gets written to a second place.* Since [Observability](#observability)
+  was added, a truncated preview of every tool result - which can include
+  real file contents or command output - is written to `logs/events.jsonl`
+  on disk. `logs/` is gitignored, but the file itself isn't encrypted,
+  access-controlled, or auto-deleted; treat it the way you'd treat shell
+  history.
 
 ## Where this sits relative to the "real" options
 
@@ -291,6 +303,104 @@ thing" property, the Tool Runner is the natural next step - same tools,
 `client.beta.messages.tool_runner(model=MODEL, tools=TOOLS, messages=messages)`
 replaces the entire `while True:` loop. That was left out here on purpose
 so the loop stays visible.
+
+## Observability
+
+Every turn writes structured events to `logs/events.jsonl` - one JSON
+object per line, gitignored, since it's a runtime artifact and not source.
+That's the entirety of [`observability.py`](./observability.py)'s job: a
+dependency-free, `grep`-it-yourself event log instead of a real tracing
+stack.
+
+What gets logged, all tagged with the same `trace_id` per turn so
+`grep <trace_id> logs/events.jsonl` reconstructs one turn, in order, from
+a flat file with no other tooling:
+
+| Event | When | Fields |
+|---|---|---|
+| `turn_start` | a task is submitted | a truncated preview of the task text |
+| `api_call` | after every Messages API response | model, `stop_reason`, latency, `input_tokens` / `output_tokens` / `cache_read_input_tokens` |
+| `tool_call` | after every tool finishes running | which tool, how long it took, a truncated result preview, a heuristic success flag |
+| `turn_end` | the turn is done | total tool calls, total wall-clock time |
+| `error` | anything escapes `run_turn()` uncaught | auth failure, rate limit, Ctrl+C |
+
+One real line (pretty-printed here - the actual file is one line per event):
+
+```json
+{"ts": 1787342493.71, "trace_id": "a48e00d00566", "event": "api_call",
+ "model": "claude-opus-5", "stop_reason": "tool_use", "latency_ms": 842.3,
+ "input_tokens": 1204, "output_tokens": 96, "cache_read_input_tokens": 0}
+```
+
+**Why a flat file instead of OpenTelemetry/Honeycomb/Langfuse/etc.:** those
+all solve the same underlying problem - what happened, in what order, how
+long did it take, at what cost - just at a scale this project doesn't
+operate at. A single local process writing to a single local file needs
+exactly zero new infrastructure to be observable; the moment more than one
+person or more than one machine needs to read these events, a real backend
+earns its complexity.
+
+**What this deliberately doesn't do** - the honest gap between "logging"
+and "observability" at production scale:
+- No exporting anywhere - the events never leave `logs/events.jsonl`. No
+  dashboards, no alerting, no distributed tracing across processes.
+- No retention policy. The file only grows; nothing rotates or caps it.
+- No built-in cost aggregation across runs - each line has the raw token
+  counts for one call; summing them into "$ spent today" is a `jq`/`awk`
+  exercise left to you (or see `evals/run_evals.py` below, which does
+  exactly this, per run, as part of grading a task).
+
+## Measuring accuracy
+
+"Accuracy" doesn't mean what it means for a classifier here - there's no
+single correct label to score a response against, because an agent's
+output is a *sequence of actions*, not a value. A few different signals
+each answer a different piece of "is this agent doing a good job," and
+this project only fully implements one of them - being explicit about
+which is more useful than pretending there's a single number:
+
+**Implemented: task-level pass/fail via a golden-task eval harness ([`evals/run_evals.py`](./evals/run_evals.py))**
+- 4 small, hand-written tasks - add a `.gitignore`, do arithmetic via
+  `bash`, edit a file with `str_replace`, chain a file-create with a
+  `bash` append - each with a known-correct end state.
+- Each task runs against the *real* CLI, as an actual `python main.py`
+  subprocess (not internals imported and called directly), in its own
+  throwaway temp directory, with `AUTO_APPROVE_BASH=true` so it can run
+  unattended. The result gets checked against the exact expected file
+  state, and the run's own `logs/events.jsonl` gets read back for the
+  tool-call count, token usage, and duration shown in the report.
+- Run it: `python evals/run_evals.py`. It needs a real `ANTHROPIC_API_KEY`
+  and makes several real API calls - it costs actual money and time, which
+  is exactly why it isn't wired into CI, the same way the sibling
+  `github-repo-mcp-server` project in this account keeps its one live-API
+  smoke test manual-only.
+- "Accuracy" here = `pass_count / total_count`. Simple and deterministic,
+  and only as good as the 4 tasks it happens to check - extending it means
+  writing another `check()` function in that file, not touching the
+  harness itself.
+
+**Signals already sitting in the logs, not yet turned into a report:**
+- *Tool-call success rate* - `tool_call` events already carry a
+  `looks_successful` heuristic; aggregating it across a session would give
+  "% of tool calls that didn't error," a cheap proxy for how often the
+  model's actions actually work.
+- *Decline rate* - how often you say `N` at the bash approval prompt. A
+  model whose proposed commands you keep declining is proposing the wrong
+  action, which is a real accuracy signal, and it's already visible by
+  grepping the logs for the decline result text.
+- *Tool calls per task, over time* - more loop iterations to do the same
+  kind of task can mean the model is thrashing, not being more thorough.
+
+**Not implemented - a real next step, not something this project needed to cover:**
+- *LLM-as-judge.* Have a separate Claude call read the full transcript and
+  the resulting diff, then grade it against a rubric - did it accomplish
+  the task, did it touch files it shouldn't have, was its summary accurate.
+  This is the standard approach once tasks stop having one checkable end
+  state ("did it refactor this well" doesn't reduce to a file existing).
+  The 4 golden tasks here were deliberately picked to avoid needing it.
+- *Human review at scale.* Fine for grading 4 tasks by hand while writing
+  them; doesn't scale past that without either LLM-as-judge or a much
+  larger library of still-deterministic `check()` functions.
 
 ## Setup
 
@@ -356,12 +466,17 @@ time you run it, not something you'd mind losing.
 coding-agent-cli/
 ├── main.py                       # REPL + the agentic loop
 ├── tools.py                      # bash + text-editor handlers, path confinement
+├── observability.py               # structured JSONL event logging (see Observability)
+├── evals/
+│   └── run_evals.py                # golden-task accuracy harness (see Measuring accuracy)
 ├── docs/
 │   └── demo.gif                  # the animated session in the Demo section
 ├── scripts/
 │   └── make_demo_gif.py          # regenerates docs/demo.gif (pip install pillow)
+├── logs/                          # gitignored - events.jsonl lands here at runtime
 ├── requirements.txt
 ├── .env.example
+├── WORKLOG.md                     # dated log of what changed and why
 └── README.md
 ```
 
@@ -378,8 +493,12 @@ missed:
   context window with no compaction or trimming strategy in place.
 - **No MCP client.** This harness only calls the two hardcoded local tools
   - it doesn't speak the Model Context Protocol to reach anything external.
-- **No test suite.** There's nothing here that isn't directly exercised by
-  actually running the CLI; correctness was verified manually, not with CI.
+- **No unit tests, no CI.** [`evals/run_evals.py`](./evals/run_evals.py)
+  covers 4 end-to-end tasks against the real CLI (see
+  [Measuring accuracy](#measuring-accuracy)), but nothing tests `tools.py`'s
+  individual functions in isolation, and nothing runs automatically on
+  push - both the evals and the manual verification behind each change
+  stay opt-in.
 - **No sub-agents, no parallelism beyond one turn's tool calls.** One
   conversation, one model, one thread of control.
 
@@ -403,6 +522,13 @@ here.
   `git commit`) will hang until the 120-second `subprocess.run` timeout
   fires, since this harness doesn't attach an interactive TTY to the child
   process.
+
+## Work log
+
+[`WORKLOG.md`](./WORKLOG.md) is a dated log of what changed in this repo
+and why, session by session - useful for "what did I even do last time"
+in a way a commit list alone isn't, since it keeps the reasoning, not just
+the diff.
 
 ## License
 

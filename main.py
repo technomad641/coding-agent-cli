@@ -26,6 +26,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from tools import TOOLS, handle_bash, handle_text_editor
+from observability import new_trace_id, log_event, preview, timer
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -92,69 +93,109 @@ def describe_call(name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_turn(user_input: str) -> None:
+def run_turn(trace_id: str, user_input: str) -> None:
     """Handle one task from the user, start to finish - including however
-    many tool calls Claude makes along the way before it's done."""
+    many tool calls Claude makes along the way before it's done.
+
+    `trace_id` ties every event this turn produces - the API call, every
+    tool call, the summary at the end - together in logs/events.jsonl. See
+    observability.py and the README's Observability section.
+    """
     messages.append({"role": "user", "content": user_input})
+    log_event("turn_start", trace_id, user_input=preview(user_input))
+    tool_call_count = 0
 
-    while True:
-        # Stream the response so text prints to the terminal as it's
-        # generated, instead of waiting for the whole reply at once.
-        # get_final_message() then hands back the complete message when
-        # streaming finishes - same shape as a non-streaming response.
-        with client.messages.stream(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            thinking={"type": "adaptive"},
-            tools=TOOLS,
-            messages=messages,
-        ) as stream:
-            for text in stream.text_stream:
-                print(text, end="", flush=True)
-            message = stream.get_final_message()
-        print()
+    with timer() as turn_timer:
+        while True:
+            # Stream the response so text prints to the terminal as it's
+            # generated, instead of waiting for the whole reply at once.
+            # get_final_message() then hands back the complete message when
+            # streaming finishes - same shape as a non-streaming response.
+            with timer() as api_timer, client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                thinking={"type": "adaptive"},
+                tools=TOOLS,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                message = stream.get_final_message()
+            print()
 
-        if message.stop_reason == "pause_turn":
-            # A server-side tool hit an internal continuation point. This
-            # harness's two tools never trigger it, but it's part of the
-            # API contract - the fix is just: resend and keep going.
-            messages.append({"role": "assistant", "content": message.content})
-            continue
-
-        if message.stop_reason == "refusal" and message.stop_details:
-            print(f"[declined: {message.stop_details.category or 'policy'}]")
-        if message.stop_reason == "max_tokens":
-            print(f"[cut off at MAX_TOKENS={MAX_TOKENS} - raise it in .env for longer responses]")
-
-        messages.append({"role": "assistant", "content": message.content})
-
-        # Did Claude ask to run any tools this turn? message.content is a
-        # list of typed blocks (text, thinking, tool_use, ...) - we only
-        # care about the tool_use ones here.
-        tool_use_blocks = [block for block in message.content if block.type == "tool_use"]
-        if not tool_use_blocks:
-            break  # nothing left to do - stop_reason was end_turn (or refusal/max_tokens)
-
-        # Run every requested tool and collect a tool_result for each one,
-        # then send them all back together in a single message - the API
-        # expects one tool_result per tool_use, all in the same turn.
-        tool_results = []
-        for block in tool_use_blocks:
-            print(f"\n[{block.name}] {describe_call(block.name, block.input)}")
-            result = execute_tool(block.name, block.input)
-            print(result)
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,  # must match this tool_use block's id
-                    "content": result,
-                }
+            # message.usage carries token counts for this one API call -
+            # the raw numbers behind whatever "cost of this turn" you'd
+            # want to compute. See the README's Observability section.
+            log_event(
+                "api_call",
+                trace_id,
+                model=message.model,
+                stop_reason=message.stop_reason,
+                latency_ms=api_timer.ms,
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+                cache_read_input_tokens=message.usage.cache_read_input_tokens,
             )
 
-        messages.append({"role": "user", "content": tool_results})
-        # Loop back around: Claude sees the tool_result(s) above and decides
-        # what to do next - reply, or ask for another tool.
+            if message.stop_reason == "pause_turn":
+                # A server-side tool hit an internal continuation point. This
+                # harness's two tools never trigger it, but it's part of the
+                # API contract - the fix is just: resend and keep going.
+                messages.append({"role": "assistant", "content": message.content})
+                continue
+
+            if message.stop_reason == "refusal" and message.stop_details:
+                print(f"[declined: {message.stop_details.category or 'policy'}]")
+            if message.stop_reason == "max_tokens":
+                print(f"[cut off at MAX_TOKENS={MAX_TOKENS} - raise it in .env for longer responses]")
+
+            messages.append({"role": "assistant", "content": message.content})
+
+            # Did Claude ask to run any tools this turn? message.content is a
+            # list of typed blocks (text, thinking, tool_use, ...) - we only
+            # care about the tool_use ones here.
+            tool_use_blocks = [block for block in message.content if block.type == "tool_use"]
+            if not tool_use_blocks:
+                break  # nothing left to do - stop_reason was end_turn (or refusal/max_tokens)
+
+            # Run every requested tool and collect a tool_result for each one,
+            # then send them all back together in a single message - the API
+            # expects one tool_result per tool_use, all in the same turn.
+            tool_results = []
+            for block in tool_use_blocks:
+                print(f"\n[{block.name}] {describe_call(block.name, block.input)}")
+                with timer() as tool_timer:
+                    result = execute_tool(block.name, block.input)
+                print(result)
+                tool_call_count += 1
+                log_event(
+                    "tool_call",
+                    trace_id,
+                    tool_name=block.name,
+                    call=preview(describe_call(block.name, block.input), 120),
+                    duration_ms=tool_timer.ms,
+                    # A heuristic, not a guarantee: our own tool handlers
+                    # only ever start a failure or a decline with "Error"
+                    # or the fixed decline string - see tools.py. Good
+                    # enough to spot a rough success rate at a glance;
+                    # don't treat it as a verified pass/fail signal.
+                    looks_successful=not result.startswith(("Error", "Command declined")),
+                    result_preview=preview(result),
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,  # must match this tool_use block's id
+                        "content": result,
+                    }
+                )
+
+            messages.append({"role": "user", "content": tool_results})
+            # Loop back around: Claude sees the tool_result(s) above and decides
+            # what to do next - reply, or ask for another tool.
+
+    log_event("turn_end", trace_id, tool_calls=tool_call_count, duration_ms=turn_timer.ms)
 
 
 # ---------------------------------------------------------------------------
@@ -178,16 +219,24 @@ def main() -> None:
         if user_input in ("exit", "quit"):
             break
 
+        # One trace_id per turn, generated here (not inside run_turn) so
+        # it's still available in the except block below if run_turn
+        # raises before logging anything itself.
+        trace_id = new_trace_id()
         try:
-            run_turn(user_input)
+            run_turn(trace_id, user_input)
         except KeyboardInterrupt:
             print("\n(interrupted)")
+            log_event("error", trace_id, kind="interrupted")
         except anthropic.AuthenticationError:
             print("Authentication failed - check ANTHROPIC_API_KEY in .env.")
+            log_event("error", trace_id, kind="authentication_error")
         except anthropic.RateLimitError:
             print("Rate limited - wait a moment and try again.")
+            log_event("error", trace_id, kind="rate_limit_error")
         except anthropic.APIError as err:
             print(f"API error: {err}")
+            log_event("error", trace_id, kind="api_error", message=preview(str(err)))
 
 
 if __name__ == "__main__":
