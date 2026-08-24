@@ -6,6 +6,43 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-24 - First real run against a live key
+
+- A funded `ANTHROPIC_API_KEY` became available for the first time. Ran
+  the pipeline for real instead of against synthetic data or a dummy key:
+  - `python main.py` with a real task ("add a .gitignore for a python
+    project that ignores `__pycache__` and `.env`") - completed correctly
+    in one tool call, 1,776+163 then 1,963+58 tokens across two `api_call`
+    events, ~$0.024, ~3.8s. `session_report.py` rendered it correctly from
+    the real `logs/events.jsonl`.
+  - `python evals/run_evals.py` - **4/4 (100%), $0.1369 total**, the golden
+    tasks' first real accuracy number. `str_replace_edit` took 3 tool
+    calls and `multi_step` took 2 (both passed anyway) - worth watching
+    whether that call count holds steady or grows on future runs.
+  - `python evals/report.py` - renders correctly with one real history
+    row; the "needs 2+ runs" empty state confirmed working as intended
+    rather than showing a broken chart.
+- **A real mistake, caught and fixed immediately:** the first attempt ran
+  `python main.py` directly inside this repo's own checkout instead of a
+  throwaway directory - exactly the scenario the README's Usage section
+  warns about. The agent did exactly what it was asked and overwrote this
+  repo's actual `.gitignore` with a project-specific one (`create` backs
+  up to `.gitignore.bak`, so nothing was destructively lost, but the
+  original was gone from the working file). Caught via `git diff --stat`,
+  fixed with `git restore .gitignore`, `.bak` removed, verified clean
+  before continuing - re-ran the same task in `/tmp/real-agent-test`
+  instead. Left in this log rather than quietly fixed, because it's a
+  real demonstration of exactly the risk the Threat model section already
+  described in the abstract.
+- The API key used for this was pasted directly into a chat message
+  rather than set via an environment variable or a locally-created
+  `.env` - written straight to a local, gitignored `.env` (confirmed with
+  `git check-ignore -v .env` before writing anything), never echoed back,
+  never committed. Recommended rotating it at
+  console.anthropic.com/settings/keys after this session regardless,
+  since a key typed into a chat transcript should be treated as exposed
+  even when nothing further goes wrong with it.
+
 ## 2026-08-24 - Cost/accuracy trend and per-session cost reports
 
 - Added `session_id` to `observability.py`: one per `python main.py`
