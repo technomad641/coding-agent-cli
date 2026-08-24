@@ -312,7 +312,8 @@ That's the entirety of [`observability.py`](./observability.py)'s job: a
 dependency-free, `grep`-it-yourself event log instead of a real tracing
 stack.
 
-What gets logged, all tagged with the same `trace_id` per turn so
+What gets logged, all tagged with a `session_id` (one per `python main.py`
+run) and a `trace_id` (one per turn within that run), so
 `grep <trace_id> logs/events.jsonl` reconstructs one turn, in order, from
 a flat file with no other tooling:
 
@@ -327,10 +328,32 @@ a flat file with no other tooling:
 One real line (pretty-printed here - the actual file is one line per event):
 
 ```json
-{"ts": 1787342493.71, "trace_id": "a48e00d00566", "event": "api_call",
- "model": "claude-opus-5", "stop_reason": "tool_use", "latency_ms": 842.3,
- "input_tokens": 1204, "output_tokens": 96, "cache_read_input_tokens": 0}
+{"ts": 1787342493.71, "session_id": "3c394815fcc8", "trace_id": "a48e00d00566",
+ "event": "api_call", "model": "claude-opus-5", "stop_reason": "tool_use",
+ "latency_ms": 842.3, "input_tokens": 1204, "output_tokens": 96,
+ "cache_read_input_tokens": 0}
 ```
+
+### Turning that into a report: `session_report.py`
+
+`logs/events.jsonl` accumulates across every run, so [`session_report.py`](./session_report.py)
+groups it by `session_id` and turns one run into an actual page instead of
+a file you'd otherwise read with `jq`:
+
+```bash
+python session_report.py                # the most recent session
+python session_report.py --all           # list every session in the log
+python session_report.py --session <id>  # a specific one
+```
+
+It writes `logs/session_report.html` - stat tiles for the session (turns,
+estimated cost, total tokens, tool calls), a per-turn bar chart splitting
+input vs. output tokens with the estimated cost of each turn labeled
+alongside it, and a detail table. A turn that errored out shows as a red
+bar and a `FAIL` status instead of being silently dropped from the report.
+Dollar figures come from [`pricing.py`](./pricing.py) - a small, hardcoded,
+point-in-time rate table (documented there as exactly that: an estimate,
+not your invoice).
 
 **Why a flat file instead of OpenTelemetry/Honeycomb/Langfuse/etc.:** those
 all solve the same underlying problem - what happened, in what order, how
@@ -345,10 +368,11 @@ and "observability" at production scale:
 - No exporting anywhere - the events never leave `logs/events.jsonl`. No
   dashboards, no alerting, no distributed tracing across processes.
 - No retention policy. The file only grows; nothing rotates or caps it.
-- No built-in cost aggregation across runs - each line has the raw token
-  counts for one call; summing them into "$ spent today" is a `jq`/`awk`
-  exercise left to you (or see `evals/run_evals.py` below, which does
-  exactly this, per run, as part of grading a task).
+- No aggregation *across sessions* - `session_report.py` reports on one
+  `python main.py` run at a time. "$ spent this week" across every session
+  in the log is still a `jq`/`awk` exercise left to you.
+- Pricing is a hardcoded snapshot in `pricing.py`, not a live lookup - see
+  that file's own docstring for what to do when it drifts out of date.
 
 ## Measuring accuracy
 
@@ -378,6 +402,21 @@ which is more useful than pretending there's a single number:
   and only as good as the 4 tasks it happens to check - extending it means
   writing another `check()` function in that file, not touching the
   harness itself.
+- Every run also appends one line to `evals/history.jsonl` (accuracy,
+  per-task results, token totals, estimated cost) - it's never overwritten,
+  so runs stay comparable across changes to the harness.
+
+**Implemented: the trend across runs ([`evals/report.py`](./evals/report.py))**
+- Reads `evals/history.jsonl` and renders `evals/report.html`: latest
+  accuracy plus its delta from the previous run, an accuracy-over-runs
+  line chart, a cost-over-runs line chart, and a full run history table.
+- This is the answer to "did my last change make the agent better or
+  worse" - a single run's stdout table can tell you *that* run's result,
+  not whether it's an improvement.
+- Run it: `python evals/report.py`, any time after at least one
+  `run_evals.py` run (it says so and exits cleanly if there isn't one yet
+  - a single run also renders fine, just with a note that the trend charts
+  need a second data point).
 
 **Signals already sitting in the logs, not yet turned into a report:**
 - *Tool-call success rate* - `tool_call` events already carry a
@@ -464,19 +503,24 @@ time you run it, not something you'd mind losing.
 
 ```
 coding-agent-cli/
-├── main.py                       # REPL + the agentic loop
-├── tools.py                      # bash + text-editor handlers, path confinement
-├── observability.py               # structured JSONL event logging (see Observability)
+├── main.py                          # REPL + the agentic loop
+├── tools.py                         # bash + text-editor handlers, path confinement
+├── observability.py                 # structured JSONL event logging (see Observability)
+├── session_report.py                # logs/events.jsonl -> a per-turn token/cost report
+├── pricing.py                       # $/token rates, shared by both reports below
+├── report_style.py                  # shared HTML/CSS + chart helpers for both reports
 ├── evals/
-│   └── run_evals.py                # golden-task accuracy harness (see Measuring accuracy)
+│   ├── run_evals.py                  # golden-task accuracy harness (see Measuring accuracy)
+│   ├── report.py                     # evals/history.jsonl -> an accuracy/cost trend report
+│   └── history.jsonl                 # gitignored - one line per run_evals.py run
 ├── docs/
-│   └── demo.gif                  # the animated session in the Demo section
+│   └── demo.gif                     # the animated session in the Demo section
 ├── scripts/
-│   └── make_demo_gif.py          # regenerates docs/demo.gif (pip install pillow)
-├── logs/                          # gitignored - events.jsonl lands here at runtime
+│   └── make_demo_gif.py             # regenerates docs/demo.gif (pip install pillow)
+├── logs/                             # gitignored - events.jsonl and generated reports land here
 ├── requirements.txt
 ├── .env.example
-├── WORKLOG.md                     # dated log of what changed and why
+├── WORKLOG.md                        # dated log of what changed and why
 └── README.md
 ```
 

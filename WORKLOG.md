@@ -6,6 +6,53 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-24 - Cost/accuracy trend and per-session cost reports
+
+- Added `session_id` to `observability.py`: one per `python main.py`
+  process, generated at import time and stamped on every event, so a
+  "session" in a report means one run - not the whole, ever-growing
+  `logs/events.jsonl` file.
+- Added [`pricing.py`](./pricing.py): a small, explicitly point-in-time
+  $/token rate table, used to turn logged token counts into an estimated
+  dollar figure. Returns `None` (not `$0.00`) for a model it has no
+  pricing for, so an unpriced call is visibly "unknown" in a report
+  instead of silently counted as free.
+- Added [`report_style.py`](./report_style.py): the shared HTML/CSS shell,
+  stat tiles, bar rows, and a small inline-SVG line-chart generator used
+  by both reports below - factored out so they read as one system, not
+  two different tools, and so a palette change happens in one place.
+- Added [`session_report.py`](./session_report.py): reads
+  `logs/events.jsonl`, groups it by `session_id`, and writes
+  `logs/session_report.html` - stat tiles, a per-turn token/cost bar
+  chart, and a detail table. `--all` lists every session in the log;
+  `--session <id>` reports on a specific one instead of the latest.
+- `evals/run_evals.py` now estimates a cost per task (via `pricing.py`)
+  and appends one line per run to `evals/history.jsonl` - never
+  overwritten, so runs stay comparable across changes.
+- Added [`evals/report.py`](./evals/report.py): reads
+  `evals/history.jsonl` and writes `evals/report.html` - accuracy and
+  cost line charts across every recorded run, plus a run history table.
+  Handles zero and one recorded run gracefully instead of drawing a
+  broken or empty chart.
+- Fixed a real bug caught while testing with a dummy key: `run_evals.py`'s
+  summary line printed `total cost: $0.0000` when no task had a priced
+  cost, instead of `?` - conflating "genuinely free" with "unknown, no
+  priced calls happened." Same `sum(...) or None` fix already used
+  elsewhere in the file.
+- Verified: `pricing.py`'s math by hand (with and without cache-read
+  tokens, and an unknown model); both report scripts against synthetic
+  data shaped exactly like the real schemas (two sessions including an
+  error turn; three eval history rows; the zero-run and one-run edge
+  cases) with the generated HTML actually screenshotted via a headless
+  browser to confirm the charts render correctly, not just that the
+  script exits 0; the full real pipeline (`main.py` -> `session_report.py`
+  and `run_evals.py` -> `evals/report.py`) end-to-end against the real
+  code under a dummy key.
+- README: Observability section documents `session_id` and
+  `session_report.py`; Measuring accuracy documents `evals/history.jsonl`
+  and `evals/report.py`, and a stale "no cost aggregation" claim was
+  corrected instead of left to rot; project layout updated.
+
 ## 2026-08-21 - Observability and an accuracy eval harness
 
 - Added [`observability.py`](./observability.py): a dependency-free

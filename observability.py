@@ -22,6 +22,13 @@ from pathlib import Path
 
 LOG_PATH = Path("logs") / "events.jsonl"
 
+# One session_id per process - generated once, the moment this module is
+# first imported, and stamped on every event this process ever logs. A
+# "session" is one `python main.py` run; logs/events.jsonl accumulates
+# across many of them, so this is what session_report.py groups by to
+# report on one run instead of the whole file's history.
+SESSION_ID = uuid.uuid4().hex[:12]
+
 # Tool results can contain a whole file's contents or a command's full
 # output. Logging that in full would make the log file balloon in size and
 # risks writing sensitive file contents to disk a second time - so anything
@@ -55,6 +62,7 @@ def log_event(event: str, trace_id: str, **fields) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "ts": time.time(),  # unix timestamp - sortable, diffable, no timezone ambiguity
+        "session_id": SESSION_ID,
         "trace_id": trace_id,
         "event": event,
         **fields,

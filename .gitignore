@@ -6,3 +6,5 @@ venv/
 *.log
 *.bak
 logs/
+evals/history.jsonl
+evals/report.html

@@ -26,16 +26,22 @@ not wired into any CI, the same way the sibling MCP-server project in this
 account treats its one live-API smoke test as manual-only.
 """
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pricing import estimate_cost_usd  # noqa: E402 - needs the path insert above first
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY = REPO_ROOT / "main.py"
+HISTORY_PATH = REPO_ROOT / "evals" / "history.jsonl"
 TASK_TIMEOUT_SECONDS = 180
 
 
@@ -182,6 +188,13 @@ def run_task(task: dict, env: dict) -> dict:
             passed, reason = False, "the CLI process crashed or timed out before finishing"
 
         metrics = _read_metrics(tmp_dir / "logs" / "events.jsonl")
+        metrics["cost_usd"] = (
+            estimate_cost_usd(
+                metrics["model"], metrics["input_tokens"], metrics["output_tokens"], metrics["cache_read_input_tokens"]
+            )
+            if metrics["model"]
+            else None
+        )
 
         return {
             "name": task["name"],
@@ -193,12 +206,12 @@ def run_task(task: dict, env: dict) -> dict:
 
 def _read_metrics(events_path: Path) -> dict:
     """Pull the numbers worth reporting out of one run's event log."""
-    import json
-
     tool_calls = 0
     input_tokens = 0
     output_tokens = 0
+    cache_read_input_tokens = 0
     duration_ms = 0.0
+    model = None
 
     if events_path.exists():
         for line in events_path.read_text().splitlines():
@@ -206,15 +219,19 @@ def _read_metrics(events_path: Path) -> dict:
             if record["event"] == "tool_call":
                 tool_calls += 1
             elif record["event"] == "api_call":
+                model = model or record.get("model")
                 input_tokens += record.get("input_tokens", 0)
                 output_tokens += record.get("output_tokens", 0)
+                cache_read_input_tokens += record.get("cache_read_input_tokens", 0)
             elif record["event"] == "turn_end":
                 duration_ms += record.get("duration_ms", 0)
 
     return {
+        "model": model,
         "tool_calls": tool_calls,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
         "duration_ms": round(duration_ms, 1),
     }
 
@@ -222,6 +239,32 @@ def _read_metrics(events_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
+
+
+def _fmt_cost(v) -> str:
+    return f"${v:.4f}" if v is not None else "?"
+
+
+def _append_history(results: list[dict]) -> None:
+    """Append one line to evals/history.jsonl - this is the file
+    evals/report.py reads to plot accuracy and cost across runs over time.
+    Never overwritten, only appended to, so old runs stay comparable."""
+    passed = sum(1 for r in results if r["passed"])
+    record = {
+        "ts": time.time(),
+        "model": next((r["model"] for r in results if r["model"]), None),
+        "tasks": results,
+        "passed": passed,
+        "total": len(results),
+        "accuracy": passed / len(results) if results else 0.0,
+        "total_input_tokens": sum(r["input_tokens"] for r in results),
+        "total_output_tokens": sum(r["output_tokens"] for r in results),
+        "total_cost_usd": sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None,
+        "total_duration_ms": sum(r["duration_ms"] for r in results),
+    }
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def main() -> None:
@@ -233,16 +276,20 @@ def main() -> None:
     print(f"Running {len(TASKS)} golden tasks against {MAIN_PY} ...\n")
     results = [run_task(task, dict(os.environ)) for task in TASKS]
 
-    print(f"{'TASK':<18} {'RESULT':<6} {'TOOL CALLS':<11} {'TOKENS (in/out)':<17} {'TIME':<8} REASON")
+    print(f"{'TASK':<18} {'RESULT':<6} {'TOOL CALLS':<11} {'TOKENS (in/out)':<17} {'COST':<9} {'TIME':<8} REASON")
     for r in results:
         status = "PASS" if r["passed"] else "FAIL"
         tokens = f"{r['input_tokens']}/{r['output_tokens']}"
         time_s = f"{r['duration_ms'] / 1000:.1f}s"
-        print(f"{r['name']:<18} {status:<6} {r['tool_calls']:<11} {tokens:<17} {time_s:<8} {r['reason']}")
+        print(f"{r['name']:<18} {status:<6} {r['tool_calls']:<11} {tokens:<17} {_fmt_cost(r['cost_usd']):<9} {time_s:<8} {r['reason']}")
 
     passed = sum(1 for r in results if r["passed"])
     total = len(results)
-    print(f"\naccuracy: {passed}/{total} ({passed / total:.0%})")
+    total_cost = sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None
+    print(f"\naccuracy: {passed}/{total} ({passed / total:.0%})   total cost: {_fmt_cost(total_cost)}")
+
+    _append_history(results)
+    print(f"\nAppended to {HISTORY_PATH.relative_to(REPO_ROOT)} - run `python evals/report.py` to see the trend across runs.")
 
 
 if __name__ == "__main__":
