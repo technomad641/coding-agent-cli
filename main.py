@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 
 from tools import TOOLS, handle_bash, handle_text_editor
 from observability import new_trace_id, log_event, preview, timer
+from pricing import estimate_cost_usd
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -46,6 +47,33 @@ client = anthropic.Anthropic(api_key=API_KEY)
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
+
+# The budget guardrail. <= 0 means disabled - no cap, no tracking overhead.
+# $1.00 is a deliberately generous default for a small learning project
+# (a full 4-task eval run costs well under $0.20 - see WORKLOG.md); it
+# exists to catch a genuine runaway loop, not to ration normal use.
+SESSION_BUDGET_USD = float(os.environ.get("SESSION_BUDGET_USD", "1.00"))
+
+# Running total for this process. One session = one python main.py run -
+# same scope as observability.py's SESSION_ID, and reset to 0 every time
+# you start the CLI, since there's no persistence across runs (yet - see
+# Known limitations in the README).
+session_cost_usd = 0.0
+_warned_unpriced_model = False  # print the "can't track cost" warning once, not every turn
+
+
+class BudgetExceeded(Exception):
+    """Raised when session_cost_usd crosses SESSION_BUDGET_USD.
+
+    Caught in main(), which ends the whole session rather than just this
+    turn: if we returned to the REPL prompt instead, `messages` could be
+    left with an assistant turn's tool_use blocks and no matching
+    tool_result (we stop before running them) - the next API call with
+    that history would be rejected outright. There's no persistence yet
+    (see Known limitations) to safely resume from anyway, so a clean stop
+    here is simpler than a half-resumable one.
+    """
+
 
 # The CLI can only see and edit this directory and whatever is below it -
 # see tools.py's resolve_within_root() for how that's enforced.
@@ -101,6 +129,8 @@ def run_turn(trace_id: str, user_input: str) -> None:
     tool call, the summary at the end - together in logs/events.jsonl. See
     observability.py and the README's Observability section.
     """
+    global session_cost_usd, _warned_unpriced_model
+
     messages.append({"role": "user", "content": user_input})
     log_event("turn_start", trace_id, user_input=preview(user_input))
     tool_call_count = 0
@@ -137,6 +167,30 @@ def run_turn(trace_id: str, user_input: str) -> None:
                 output_tokens=message.usage.output_tokens,
                 cache_read_input_tokens=message.usage.cache_read_input_tokens,
             )
+
+            # The budget guardrail: tally this call's cost and stop before
+            # running anything else - another API call or the tool calls
+            # Claude just asked for - the moment the running total reaches
+            # the cap. Checked here, not just between turns, so one very
+            # long tool-calling turn can't blow past it unnoticed.
+            call_cost = estimate_cost_usd(
+                message.model,
+                message.usage.input_tokens,
+                message.usage.output_tokens,
+                message.usage.cache_read_input_tokens,
+            )
+            if call_cost is None:
+                if SESSION_BUDGET_USD > 0 and not _warned_unpriced_model:
+                    print(f"[no pricing data for {message.model} - the session budget can't track this call's cost]")
+                    _warned_unpriced_model = True
+            else:
+                session_cost_usd += call_cost
+                if SESSION_BUDGET_USD > 0 and session_cost_usd >= SESSION_BUDGET_USD:
+                    raise BudgetExceeded(
+                        f"session cost ${session_cost_usd:.4f} has reached the ${SESSION_BUDGET_USD:.2f} "
+                        f"session budget (SESSION_BUDGET_USD in .env) - stopping now, before running "
+                        f"anything else."
+                    )
 
             if message.stop_reason == "pause_turn":
                 # A server-side tool hit an internal continuation point. This
@@ -204,8 +258,10 @@ def run_turn(trace_id: str, user_input: str) -> None:
 
 
 def main() -> None:
+    budget_line = f"${SESSION_BUDGET_USD:.2f}" if SESSION_BUDGET_USD > 0 else "none (disabled)"
     print(f"coding-agent-cli - basic coding harness ({MODEL})")
     print(f"project root: {ROOT}")
+    print(f"session budget: {budget_line} (SESSION_BUDGET_USD in .env - 0 disables it)")
     print('type a task, or "exit" to quit\n')
 
     while True:
@@ -225,6 +281,10 @@ def main() -> None:
         trace_id = new_trace_id()
         try:
             run_turn(trace_id, user_input)
+        except BudgetExceeded as err:
+            print(f"\n{err}")
+            log_event("error", trace_id, kind="budget_exceeded", session_cost_usd=round(session_cost_usd, 4))
+            break  # end the session outright, not just this turn - see BudgetExceeded's docstring
         except KeyboardInterrupt:
             print("\n(interrupted)")
             log_event("error", trace_id, kind="interrupted")

@@ -6,6 +6,44 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-24 - Budget guardrail
+
+- `main.py` now tallies `pricing.estimate_cost_usd(...)` after every API
+  response and raises internally the moment the running session total
+  reaches `SESSION_BUDGET_USD` (default `1.00`, `0` disables it) -
+  checked after every call, not just between turns, so one long
+  tool-calling turn can't blow past the cap unnoticed. Hitting it ends
+  the whole session, not just the current task: returning to the prompt
+  instead would leave `messages` with a tool_use and no matching
+  tool_result, which the next API call would reject outright, and
+  there's no persistence yet to safely resume from anyway.
+- Logged as an `error` event with `kind: "budget_exceeded"` - reused the
+  existing event/kind pattern instead of inventing a new event type, so
+  `session_report.py` needed zero changes to render it correctly (shows
+  as a FAIL with a red bar, same as any other failed turn).
+- Startup banner now prints the configured budget, so it's never a silent
+  surprise: `session budget: $1.00 (SESSION_BUDGET_USD in .env - 0
+  disables it)`.
+- If `CLAUDE_MODEL` points at a model `pricing.py` has no rate for, the
+  guardrail can't track cost for those calls - warns once, at the first
+  such call, instead of silently doing nothing.
+- **Verified for real**, not just against a dummy key: set
+  `SESSION_BUDGET_USD=0.005` in a throwaway directory and confirmed it
+  tripped after exactly one API call, before the pending tool call ran
+  (`one.txt` was never created), logged correctly, ended the session
+  outright (a second queued task in stdin was never attempted), and
+  rendered correctly in `session_report.py` - screenshotted to confirm,
+  same as prior report work.
+- **Found a real, separate, unfixed bug while keeping that test cheap**:
+  tried `CLAUDE_MODEL=claude-haiku-4-5` to use a cheaper model for the
+  trip test, and every call failed with `adaptive thinking is not
+  supported on this model`. `main.py` hardcodes
+  `thinking={"type": "adaptive"}` for every request; Haiku-tier models
+  don't support it. Out of scope for today's task, so not fixed here -
+  documented in the Configuration table and Troubleshooting instead of
+  silently worked around, since going quiet about a bug found by accident
+  isn't the same as it not existing.
+
 ## 2026-08-24 - First real run against a live key
 
 - A funded `ANTHROPIC_API_KEY` became available for the first time. Ran

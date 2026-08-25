@@ -355,6 +355,35 @@ Dollar figures come from [`pricing.py`](./pricing.py) - a small, hardcoded,
 point-in-time rate table (documented there as exactly that: an estimate,
 not your invoice).
 
+### Stopping before it gets expensive: the budget guardrail
+
+`SESSION_BUDGET_USD` (defaults to `1.00`) turns that same cost estimate
+from a report you read afterward into an active control: `main.py` tallies
+`pricing.estimate_cost_usd(...)` after every API response, and the moment
+the running total for the session reaches the cap, it raises internally
+and the CLI stops - printing why, logging an `error` event with
+`kind: "budget_exceeded"` (so it shows up in `session_report.py` like any
+other failed turn), and ending the process. Set it to `0` to disable.
+
+Two decisions worth explaining:
+
+- **Checked after every API call, not just between turns.** A single turn
+  can involve several tool-calling round-trips before it's done; checking
+  only between turns would let one long turn blow straight past the cap.
+  This checks the moment each response comes back, before any tool calls
+  that response asked for get to run.
+- **Hitting the cap ends the whole session, not just the current task.**
+  The alternative - stopping just this turn and returning to the prompt -
+  would leave `messages` holding a tool_use with no matching tool_result
+  (execution was refused), which the next API call would reject outright.
+  There's no persistence yet to safely resume from either way (see
+  [Known limitations](#known-limitations-non-goals-not-oversights)), so a
+  clean stop is simpler than a half-resumable one.
+
+If `CLAUDE_MODEL` points at a model `pricing.py` has no rate for, the
+guardrail can't compute a cost for those calls - it says so once, at the
+first such call, rather than silently doing nothing.
+
 **Why a flat file instead of OpenTelemetry/Honeycomb/Langfuse/etc.:** those
 all solve the same underlying problem - what happened, in what order, how
 long did it take, at what cost - just at a scale this project doesn't
@@ -495,9 +524,10 @@ time you run it, not something you'd mind losing.
 | Variable | Default | What it does |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | *(required)* | Your Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com/settings/keys). |
-| `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. |
+| `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. Known gap: fails on `claude-haiku-4-5` - see [Troubleshooting](#troubleshooting). Stick to Opus/Sonnet-5-tier models for now. |
 | `MAX_TOKENS` | `8192` | Per-response token ceiling. Raised responses cost more and take longer to stream; lowered ones risk mid-thought truncation (the CLI will tell you when this happens). |
 | `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
+| `SESSION_BUDGET_USD` | `1.00` | Stop the session once its estimated cost reaches this. `0` disables it. See [Observability](#observability). |
 
 ## Project layout
 
@@ -566,6 +596,13 @@ here.
   `git commit`) will hang until the 120-second `subprocess.run` timeout
   fires, since this harness doesn't attach an interactive TTY to the child
   process.
+- **`API error: ... adaptive thinking is not supported on this model`
+  with `CLAUDE_MODEL=claude-haiku-4-5`** - a real, currently-unfixed gap,
+  not a config mistake: `main.py` always requests adaptive thinking
+  (`thinking={"type": "adaptive"}`), which every call needs, but
+  Haiku-tier models don't support it. Discovered while cost-testing the
+  budget guardrail against a cheaper model - see `WORKLOG.md`. Stick to
+  Opus/Sonnet-5-tier models in `CLAUDE_MODEL` until this is fixed.
 
 ## Work log
 
