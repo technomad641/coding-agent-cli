@@ -524,7 +524,7 @@ time you run it, not something you'd mind losing.
 | Variable | Default | What it does |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | *(required)* | Your Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com/settings/keys). |
-| `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. Known gap: fails on `claude-haiku-4-5` - see [Troubleshooting](#troubleshooting). Stick to Opus/Sonnet-5-tier models for now. |
+| `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. Adaptive thinking is only requested for models that support it (`MODELS_WITH_ADAPTIVE_THINKING` in `main.py`) - anything else, including Haiku-tier models, runs without it instead of erroring. |
 | `MAX_TOKENS` | `8192` | Per-response token ceiling. Raised responses cost more and take longer to stream; lowered ones risk mid-thought truncation (the CLI will tell you when this happens). |
 | `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
 | `SESSION_BUDGET_USD` | `1.00` | Stop the session once its estimated cost reaches this. `0` disables it. See [Observability](#observability). |
@@ -596,13 +596,6 @@ here.
   `git commit`) will hang until the 120-second `subprocess.run` timeout
   fires, since this harness doesn't attach an interactive TTY to the child
   process.
-- **`API error: ... adaptive thinking is not supported on this model`
-  with `CLAUDE_MODEL=claude-haiku-4-5`** - a real, currently-unfixed gap,
-  not a config mistake: `main.py` always requests adaptive thinking
-  (`thinking={"type": "adaptive"}`), which every call needs, but
-  Haiku-tier models don't support it. Discovered while cost-testing the
-  budget guardrail against a cheaper model - see `WORKLOG.md`. Stick to
-  Opus/Sonnet-5-tier models in `CLAUDE_MODEL` until this is fixed.
 
 ## Work log
 

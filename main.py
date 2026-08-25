@@ -48,6 +48,21 @@ client = anthropic.Anthropic(api_key=API_KEY)
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 
+# Adaptive thinking is on by default below, but only these model families
+# actually support it - Haiku-tier models reject the request outright
+# (see WORKLOG.md for how that was found). Anything not in this set just
+# runs without thinking instead of erroring - a valid, simply less-guided
+# mode, not a degraded one.
+MODELS_WITH_ADAPTIVE_THINKING = {
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+}
+
 # The budget guardrail. <= 0 means disabled - no cap, no tracking overhead.
 # $1.00 is a deliberately generous default for a small learning project
 # (a full 4-task eval run costs well under $0.20 - see WORKLOG.md); it
@@ -141,14 +156,17 @@ def run_turn(trace_id: str, user_input: str) -> None:
             # generated, instead of waiting for the whole reply at once.
             # get_final_message() then hands back the complete message when
             # streaming finishes - same shape as a non-streaming response.
-            with timer() as api_timer, client.messages.stream(
+            request_kwargs = dict(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
-                thinking={"type": "adaptive"},
                 tools=TOOLS,
                 messages=messages,
-            ) as stream:
+            )
+            if MODEL in MODELS_WITH_ADAPTIVE_THINKING:
+                request_kwargs["thinking"] = {"type": "adaptive"}
+
+            with timer() as api_timer, client.messages.stream(**request_kwargs) as stream:
                 for text in stream.text_stream:
                     print(text, end="", flush=True)
                 message = stream.get_final_message()

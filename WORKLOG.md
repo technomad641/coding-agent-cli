@@ -6,6 +6,29 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-24 - Fixed the Haiku adaptive-thinking bug
+
+- `main.py` requested `thinking={"type": "adaptive"}` on every call
+  unconditionally; Haiku-tier models reject it outright (400). Added
+  `MODELS_WITH_ADAPTIVE_THINKING`, a small explicit allowlist, and only
+  include `thinking` in the request when `CLAUDE_MODEL` is in it -
+  anything else (Haiku included, and any future/older model not on the
+  list) now just runs without thinking instead of erroring. A safe
+  fallback, not a degraded one - that's a normal way to run a request.
+- Verified for real: re-ran the exact task that failed yesterday with
+  `CLAUDE_MODEL=claude-haiku-4-5` in a throwaway directory - completed
+  correctly this time, file created with the right content.
+- Noticed something adjacent while verifying, not fixed, not in scope:
+  the API echoed back `claude-haiku-4-5-20251001` (a dated snapshot) in
+  `message.model`, not the bare alias that was requested, so
+  `pricing.py`'s exact-match lookup can't find it. This isn't a new
+  failure mode - it's the existing "no pricing data, warn once" fallback
+  from the budget guardrail work firing correctly. Left as-is.
+- README: Configuration table's `CLAUDE_MODEL` row and the Troubleshooting
+  entry both updated - the gap they described no longer exists, so the
+  fix replaced the warning instead of leaving it to rot next to the code
+  that resolved it.
+
 ## 2026-08-24 - Budget guardrail
 
 - `main.py` now tallies `pricing.estimate_cost_usd(...)` after every API
