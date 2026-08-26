@@ -6,6 +6,40 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-26 - Unit tests for `tools.py`, in isolation
+
+- Added `tests/test_tools.py` (stdlib `unittest`, no new dependency) - 26
+  tests covering `resolve_within_root()`, `handle_bash()`, and
+  `handle_text_editor()` plus its `_view`/`_create`/`_str_replace`/`_insert`
+  helpers, calling each function directly with hand-picked inputs instead
+  of going through a real model or subprocess. Run with
+  `python -m unittest discover -s tests`.
+- This is a different kind of coverage than `evals/run_evals.py`, not a
+  replacement for it - the eval harness proves the *whole agent* does the
+  right thing end to end via a real model and real subprocess; this suite
+  proves each *function* does the right thing for inputs a well-behaved
+  model would rarely produce on its own: a path that resolves outside the
+  project root (including a symlink physically inside root that points
+  outside it - planted with a real `Path.symlink_to()` in a throwaway temp
+  dir, same technique used earlier in this project to verify the
+  prompt-injection mitigation), `str_replace` with zero or multiple
+  matches, a declined bash command, a bash timeout (mocked via
+  `subprocess.TimeoutExpired`, not an actual 120-second wait), and output
+  truncation (patches `MAX_BASH_OUTPUT_CHARS` down instead of generating
+  real megabytes of text). Fast (under 0.2s for the whole suite), free, no
+  `ANTHROPIC_API_KEY` needed.
+- **Verified the suite actually catches regressions, not just that it
+  passes on unmodified code**: temporarily mutated `tools.py` so
+  `_str_replace` allowed ambiguous replacements through (`occurrences > 1`
+  changed to `occurrences > 5`) and re-ran the suite - it failed exactly
+  where expected (`test_str_replace_errors_on_multiple_matches`), then
+  reverted the mutation via `git checkout -- tools.py` and confirmed green
+  again. A suite that can't fail isn't testing anything.
+- Updated the README's Known limitations bullet (was "No unit tests, no
+  CI") to describe what's now covered and what's still missing (CI only -
+  both suites still run by hand before a commit), and added `tests/` to
+  the Project layout tree.
+
 ## 2026-08-26 - A partial prompt-injection mitigation
 
 - Every tool result now gets wrapped, via `wrap_untrusted()` in `main.py`,

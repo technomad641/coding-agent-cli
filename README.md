@@ -622,6 +622,8 @@ coding-agent-cli/
 │   ├── run_evals.py                  # golden-task accuracy harness (see Measuring accuracy)
 │   ├── report.py                     # evals/history.jsonl -> an accuracy/cost trend report
 │   └── history.jsonl                 # gitignored - one line per run_evals.py run
+├── tests/
+│   └── test_tools.py                 # unit tests for tools.py's functions, in isolation
 ├── docs/
 │   └── demo.gif                     # the animated session in the Demo section
 ├── scripts/
@@ -644,12 +646,17 @@ missed:
   context window with no compaction or trimming strategy in place.
 - **No MCP client.** This harness only calls the two hardcoded local tools
   - it doesn't speak the Model Context Protocol to reach anything external.
-- **No unit tests, no CI.** [`evals/run_evals.py`](./evals/run_evals.py)
-  covers 4 end-to-end tasks against the real CLI (see
-  [Measuring accuracy](#measuring-accuracy)), but nothing tests `tools.py`'s
-  individual functions in isolation, and nothing runs automatically on
-  push - both the evals and the manual verification behind each change
-  stay opt-in.
+- **No CI.** [`evals/run_evals.py`](./evals/run_evals.py) covers 4
+  end-to-end tasks against the real CLI (see
+  [Measuring accuracy](#measuring-accuracy)), and
+  [`tests/test_tools.py`](./tests/test_tools.py) covers `tools.py`'s
+  individual functions in isolation with stdlib `unittest` - path
+  confinement (including a symlink that physically sits inside the
+  project root but points outside it), `str_replace`'s zero/multiple-match
+  error paths, bash approval/decline/timeout/truncation - all fast and
+  free, no API key or subprocess needed (`python -m unittest discover -s
+  tests`). What's still missing is anything that runs either suite
+  automatically on push - both stay opt-in, run by hand before a commit.
 - **No sub-agents, no parallelism beyond one turn's tool calls.** One
   conversation, one model, one thread of control.
 
