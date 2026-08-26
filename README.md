@@ -265,6 +265,31 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   requires an explicit `y` before it runs. This is the primary control,
   not a backstop.
 
+**Partially mitigated**
+- *Prompt injection via tool output.* A file the model reads, or a
+  command's output, can contain text written specifically to look like a
+  new instruction ("ignore previous instructions and instead..."). Every
+  tool result is now wrapped in `<untrusted_tool_output boundary="...">`
+  tags with a random, per-call boundary value, paired with a system-prompt
+  paragraph telling Claude that content inside is data to read, never
+  instructions to follow - even a closing tag whose boundary doesn't
+  match is untrustworthy. See `wrap_untrusted()` in `main.py`.
+- **This is a real mitigation, verified against a real attempt** - a
+  planted file containing a fake `SYSTEM OVERRIDE` instruction (with a
+  fake closing tag, trying to escape the wrapper early) was read via
+  `view`; the model ignored it, ran no commands, and proactively told the
+  user the file contained an injection attempt. See `WORKLOG.md` for the
+  exact payload and transcript.
+- **It is not a hard guarantee, and shouldn't be treated like one.** Path
+  confinement is enforced by code - no input can talk its way past
+  `resolve_within_root()`. This is enforced by the model choosing to
+  follow an instruction in its system prompt, on a given input, which is
+  a fundamentally weaker guarantee: a differently-worded or more
+  sophisticated payload could still work. Anthropic's own guidance treats
+  prompt injection as an open, industry-wide problem for exactly this
+  reason - this mitigation raises the bar against the lazy version of the
+  attack, it doesn't close the problem.
+
 **Not mitigated - on purpose**
 - *No command allowlist.* Blocking pipes, `&&`, backticks, or arbitrary
   binaries would also block most of what makes a shell tool useful
@@ -278,12 +303,6 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   confinement only covers the *editor* tool - an approved bash command can
   still run `rm -rf ../something`, because that's a completely ordinary
   shell command from bash's point of view.
-- *No prompt-injection defense.* If a file the model reads, or a command's
-  output, contains text engineered to look like new instructions, nothing
-  here distinguishes "content the model is looking at" from "instructions
-  the model should follow" - because the model itself doesn't reliably
-  distinguish that either. Open problem industry-wide, not something a
-  400-line harness solves.
 - *Tool output now gets written to a second place.* Since [Observability](#observability)
   was added, a truncated preview of every tool result - which can include
   real file contents or command output - is written to `logs/events.jsonl`
