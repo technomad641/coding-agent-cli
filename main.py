@@ -12,26 +12,49 @@ file just doesn't hide it behind an SDK.
 
 Run it with:
 
-    python main.py
+    python main.py                  # start a new conversation
+    python main.py --resume         # continue the most recently saved one
+    python main.py --resume <id>    # continue a specific one
+    python main.py --list           # see what's resumable
 
 See README.md for the full walkthrough (architecture diagram, a sequence
 diagram of one turn, and the threat model for what is and isn't guarded).
 """
 
+import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
 
 from tools import TOOLS, handle_bash, handle_text_editor
-from observability import new_trace_id, log_event, preview, timer
+from observability import new_trace_id, log_event, preview, timer, SESSION_ID
 from pricing import estimate_cost_usd
+import session_store
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+
+# --resume/--list are parsed here (not deep inside main()) purely so they
+# sit next to the rest of this file's config resolution - nothing here has
+# a side effect yet, main() decides what to actually do with them.
+_arg_parser = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=argparse.RawDescriptionHelpFormatter,  # keep the docstring's own line breaks in --help
+)
+_arg_parser.add_argument(
+    "--resume",
+    nargs="?",
+    const="__latest__",  # `--resume` with no value: pick the most recent saved session
+    metavar="SESSION_ID",
+    help="resume a saved conversation (most recent one if no ID is given)",
+)
+_arg_parser.add_argument("--list", action="store_true", help="list saved sessions and exit")
+ARGS = _arg_parser.parse_args()
 
 # Reads a .env file in the current directory (if one exists) into the
 # process's environment variables - this is how ANTHROPIC_API_KEY gets set
@@ -69,10 +92,11 @@ MODELS_WITH_ADAPTIVE_THINKING = {
 # exists to catch a genuine runaway loop, not to ration normal use.
 SESSION_BUDGET_USD = float(os.environ.get("SESSION_BUDGET_USD", "1.00"))
 
-# Running total for this process. One session = one python main.py run -
-# same scope as observability.py's SESSION_ID, and reset to 0 every time
-# you start the CLI, since there's no persistence across runs (yet - see
-# Known limitations in the README).
+# Running total for this process only - deliberately not saved or
+# restored across a --resume, even though the conversation itself now is
+# (see session_store.py). The cap is meant to catch one runaway process,
+# not to be a lifetime budget for a conversation you might resume many
+# times; each fresh process gets a fresh cap.
 session_cost_usd = 0.0
 _warned_unpriced_model = False  # print the "can't track cost" warning once, not every turn
 
@@ -84,9 +108,12 @@ class BudgetExceeded(Exception):
     turn: if we returned to the REPL prompt instead, `messages` could be
     left with an assistant turn's tool_use blocks and no matching
     tool_result (we stop before running them) - the next API call with
-    that history would be rejected outright. There's no persistence yet
-    (see Known limitations) to safely resume from anyway, so a clean stop
-    here is simpler than a half-resumable one.
+    that history would be rejected outright. session_store.save_session()
+    is only ever called after a turn fully completes (see run_turn()), so
+    the aborted turn was never persisted in the first place - the last
+    thing on disk is the state right before it, which `--resume` picks up
+    from cleanly. Ending the process here just means "stop before making
+    that unsaved state the one you'd resume into."
     """
 
 
@@ -102,9 +129,20 @@ Be direct and concise. When a task is done, stop and summarize what changed inst
 
 # The whole conversation so far, as a plain list of {"role": ..., "content": ...}
 # dicts. The Messages API is stateless - we resend this entire list on every
-# request - so this list IS the model's memory of the session. Nothing else
-# is stored anywhere.
+# request - so this list IS the model's memory of the session. --resume
+# seeds this from a saved file (see main()) instead of starting empty.
 messages: list[dict] = []
+
+# Which sessions/<id>.json this conversation is saved to. Defaults to this
+# process's own observability SESSION_ID (see session_store.py's docstring
+# for why those two ids are related but not forced to always match);
+# main() overwrites this if --resume loads an older conversation instead.
+CONVERSATION_ID = SESSION_ID
+
+# How many turns this conversation has completed in total, including ones
+# from before a resume - persisted alongside messages so session_store's
+# --list output shows an accurate count, not just this process's turns.
+completed_turns = 0
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +157,31 @@ def execute_tool(name: str, tool_input: dict) -> str:
     if name == "str_replace_based_edit_tool":
         return handle_text_editor(tool_input, ROOT)
     return f'Error: unknown tool "{name}"'
+
+
+def assistant_turn(message) -> dict:
+    """Turn an API response into the {"role": "assistant", ...} entry we
+    append to `messages`.
+
+    message.content is a list of typed SDK objects (TextBlock,
+    ToolUseBlock, ...) - fine to send straight back to the API (the SDK
+    serializes them for you), but json.dumps() can't handle them directly.
+    model_dump(mode="json") converts the whole response to plain dicts in
+    one call, so `messages` stays uniformly JSON-serializable - which is
+    what makes session_store.py's job trivial: just dump the list, no
+    Anthropic-SDK-specific logic needed there at all.
+
+    exclude_unset=True matters here, not just style: response objects carry
+    optional fields (e.g. `citations`) that default to None and were never
+    actually set by the API for a given block. Plain model_dump() includes
+    them anyway as explicit nulls - which the API's *request* schema then
+    rejects with "Extra inputs are not permitted" the next time this
+    message is sent back (only found by actually resuming a real saved
+    session - see WORKLOG.md). exclude_unset drops anything that wasn't
+    really there, matching what the SDK itself sends when you pass the
+    typed objects straight through instead of a dict.
+    """
+    return {"role": "assistant", "content": message.model_dump(mode="json", exclude_unset=True)["content"]}
 
 
 def describe_call(name: str, tool_input: dict) -> str:
@@ -144,7 +207,7 @@ def run_turn(trace_id: str, user_input: str) -> None:
     tool call, the summary at the end - together in logs/events.jsonl. See
     observability.py and the README's Observability section.
     """
-    global session_cost_usd, _warned_unpriced_model
+    global session_cost_usd, _warned_unpriced_model, completed_turns
 
     messages.append({"role": "user", "content": user_input})
     log_event("turn_start", trace_id, user_input=preview(user_input))
@@ -214,7 +277,7 @@ def run_turn(trace_id: str, user_input: str) -> None:
                 # A server-side tool hit an internal continuation point. This
                 # harness's two tools never trigger it, but it's part of the
                 # API contract - the fix is just: resend and keep going.
-                messages.append({"role": "assistant", "content": message.content})
+                messages.append(assistant_turn(message))
                 continue
 
             if message.stop_reason == "refusal" and message.stop_details:
@@ -222,7 +285,7 @@ def run_turn(trace_id: str, user_input: str) -> None:
             if message.stop_reason == "max_tokens":
                 print(f"[cut off at MAX_TOKENS={MAX_TOKENS} - raise it in .env for longer responses]")
 
-            messages.append({"role": "assistant", "content": message.content})
+            messages.append(assistant_turn(message))
 
             # Did Claude ask to run any tools this turn? message.content is a
             # list of typed blocks (text, thinking, tool_use, ...) - we only
@@ -269,13 +332,70 @@ def run_turn(trace_id: str, user_input: str) -> None:
 
     log_event("turn_end", trace_id, tool_calls=tool_call_count, duration_ms=turn_timer.ms)
 
+    # Persist after the turn is fully done, never mid-turn - a save only
+    # ever captures a "clean" state (every tool_use already has its
+    # tool_result), the same state a fresh API call could safely continue
+    # from. See session_store.py.
+    completed_turns += 1
+    session_store.save_session(CONVERSATION_ID, MODEL, ROOT, messages, completed_turns)
+
 
 # ---------------------------------------------------------------------------
 # The REPL
 # ---------------------------------------------------------------------------
 
 
+def print_sessions() -> None:
+    """`--list`'s entire job: show what's resumable and how to resume it."""
+    sessions = session_store.list_sessions()
+    if not sessions:
+        print("No saved sessions yet - one is saved automatically after your first task.")
+        return
+    print(f"{len(sessions)} saved session(s):\n")
+    for s in sessions:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated_at"]))
+        print(f'  {s["session_id"]}   {when}   {s["turn_count"]} turn(s)   {s["model"]}   {s["root"]}')
+    print("\nResume the most recent with:  python main.py --resume")
+    print("Resume a specific one with:   python main.py --resume <session_id>")
+
+
+def resume_session(requested_id: str) -> None:
+    """--resume's entire job: load a saved conversation into `messages` and
+    point CONVERSATION_ID at it, so run_turn() keeps saving to the same
+    file instead of starting a new one."""
+    global CONVERSATION_ID, completed_turns
+
+    session_id = requested_id
+    if session_id == "__latest__":
+        session_id = session_store.most_recent_session_id()
+        if session_id is None:
+            print("No saved sessions to resume - see `python main.py --list`.")
+            sys.exit(1)
+
+    try:
+        saved = session_store.load_session(session_id)
+    except FileNotFoundError:
+        print(f'No saved session "{session_id}" - see `python main.py --list`.')
+        sys.exit(1)
+
+    messages.extend(saved["messages"])
+    completed_turns = saved.get("turn_count", 0)
+    CONVERSATION_ID = session_id
+
+    print(f"resumed session {session_id} - {completed_turns} prior turn(s), {len(messages)} message(s)")
+    if saved.get("root") and saved["root"] != str(ROOT):
+        print(f"note: this session was last used in {saved['root']}, not here ({ROOT}) - file paths in its history may not resolve.")
+    print()
+
+
 def main() -> None:
+    if ARGS.list:
+        print_sessions()
+        return
+
+    if ARGS.resume:
+        resume_session(ARGS.resume)
+
     budget_line = f"${SESSION_BUDGET_USD:.2f}" if SESSION_BUDGET_USD > 0 else "none (disabled)"
     print(f"coding-agent-cli - basic coding harness ({MODEL})")
     print(f"project root: {ROOT}")

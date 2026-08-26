@@ -8,3 +8,4 @@ venv/
 logs/
 evals/history.jsonl
 evals/report.html
+sessions/

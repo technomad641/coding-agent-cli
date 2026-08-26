@@ -59,6 +59,7 @@ flowchart TD
         Shell[("subprocess.run\ncwd = project root")]
         FS[("pathlib read/write\nproject root only")]
         Logs[("logs/events.jsonl")]
+        Sessions[("sessions/{id}.json")]
     end
 
     subgraph Remote["Anthropic's servers"]
@@ -77,6 +78,7 @@ flowchart TD
     REPL -->|"loop until stop_reason: end_turn"| API
     API -->|"stop_reason: end_turn"| U
     REPL -.->|"structured events"| Logs
+    REPL <-.->|"--resume reads / saves after each turn"| Sessions
 
     classDef guarded fill:#4d2d00,stroke:#d29922,color:#ffe7b3,stroke-width:2px
     class Bash,Editor guarded
@@ -101,20 +103,24 @@ Reading it:
   flagged as blocked content or 404s on a relative path, since the diagram
   renders inside a sandboxed iframe) - the file table right below does that
   job instead, reliably.
-- **The dotted edge is a side-channel, not the main request loop** - as the
-  REPL runs, it also writes a structured event to `logs/events.jsonl`;
-  that's a fire-and-forget write, not something anything downstream reads
-  back. See [Observability](#observability).
+- **Dotted edges are side-channels, not the main request loop.** The write
+  to `Logs` is fire-and-forget - nothing reads it back. The `Sessions`
+  edge is the one two-way exception: written after every completed turn,
+  and read back once at startup if you pass `--resume`. See
+  [Observability](#observability) and [Resuming a session](#resuming-a-session).
 
-The whole system is two files:
+The loop itself is still just two files - everything else in the repo
+(observability, persistence, the reports) sits *around* this core, not
+inside it:
 
 | File | Responsibility |
 |---|---|
 | [`main.py`](./main.py) | The REPL and the agentic loop itself: streams a response, inspects `stop_reason`, dispatches `tool_use` blocks, feeds `tool_result`s back, repeats. |
 | [`tools.py`](./tools.py) | Everything that actually touches your machine: the bash executor, the text-editor command handlers, and the path-confinement logic that gates both. |
 
-There's no third layer. No planner, no memory store, no vector index, no
-sub-agents. The conversation list *is* the state.
+No planner, no vector index, no sub-agents. The conversation list *is*
+the state - `session_store.py` just means it isn't *only* in memory
+anymore. See [Project layout](#project-layout) for the full file list.
 
 ## How the loop actually works
 
@@ -376,9 +382,13 @@ Two decisions worth explaining:
   The alternative - stopping just this turn and returning to the prompt -
   would leave `messages` holding a tool_use with no matching tool_result
   (execution was refused), which the next API call would reject outright.
-  There's no persistence yet to safely resume from either way (see
-  [Known limitations](#known-limitations-non-goals-not-oversights)), so a
-  clean stop is simpler than a half-resumable one.
+  [Session persistence](#resuming-a-session) only ever saves a *completed*
+  turn, so the aborted one was never written to disk - `--resume` picks up
+  cleanly from right before it.
+- **The budget itself doesn't persist across a `--resume`**, even though
+  the conversation does. It's a per-process cap meant to catch one runaway
+  run, not a lifetime allowance for a conversation you might resume many
+  times - each fresh process gets a fresh `SESSION_BUDGET_USD`.
 
 If `CLAUDE_MODEL` points at a model `pricing.py` has no rate for, the
 guardrail can't compute a cost for those calls - it says so once, at the
@@ -489,6 +499,7 @@ files parse without actually running the CLI.
 $ python main.py
 coding-agent-cli - basic coding harness (claude-opus-5)
 project root: /Users/you/scratch/test-project
+session budget: $1.00 (SESSION_BUDGET_USD in .env - 0 disables it)
 type a task, or "exit" to quit
 
 > add a .gitignore for a node project
@@ -519,6 +530,54 @@ that directory *is* the project it can see and edit, for the reasons in
 the threat model above. Point it at a disposable test folder the first
 time you run it, not something you'd mind losing.
 
+## Resuming a session
+
+Closing the CLI doesn't lose the conversation - [`session_store.py`](./session_store.py)
+saves it to `sessions/<id>.json` (gitignored - it's your conversation
+history, not source) after every completed turn, and a later run can pick
+it back up:
+
+```bash
+python main.py --list             # see what's resumable
+python main.py --resume           # continue the most recently used session
+python main.py --resume <id>      # continue a specific one
+```
+
+```
+$ python main.py --list
+1 saved session(s):
+
+  35be702dead3   2026-08-26 00:47   2 turn(s)   claude-opus-5   /tmp/resume-test2
+
+Resume the most recent with:  python main.py --resume
+Resume a specific one with:   python main.py --resume <session_id>
+
+$ python main.py --resume
+resumed session 35be702dead3 - 2 prior turn(s), 6 message(s)
+
+coding-agent-cli - basic coding harness (claude-opus-5)
+...
+```
+
+A save only ever happens after a turn *fully* completes - never mid-turn -
+so what's on disk is always in a state a fresh API call could safely
+continue from. That's also why hitting the [budget guardrail](#stopping-before-it-gets-expensive-the-budget-guardrail)
+ends the process outright instead of returning to the prompt: the turn
+that tripped it was never saved, so ending there just avoids resuming into
+state that was never written down in the first place.
+
+If you resume a session whose saved `root` doesn't match the directory
+you're running from, the CLI tells you rather than silently pretending
+nothing's different - file paths from the earlier conversation may not
+resolve to anything in the new location.
+
+One subtlety worth knowing about, not just skimming past: a session's
+*filename* is the `session_id` of whichever process **started** it, but
+each process - including the one resuming it - still gets its own,
+different id for its own [observability](#observability) events in
+`logs/events.jsonl`. They're related, deliberately not merged into one -
+see `session_store.py`'s module docstring for why.
+
 ## Configuration (`.env`)
 
 | Variable | Default | What it does |
@@ -536,6 +595,7 @@ coding-agent-cli/
 ├── main.py                          # REPL + the agentic loop
 ├── tools.py                         # bash + text-editor handlers, path confinement
 ├── observability.py                 # structured JSONL event logging (see Observability)
+├── session_store.py                 # sessions/<id>.json save + load (see Resuming a session)
 ├── session_report.py                # logs/events.jsonl -> a per-turn token/cost report
 ├── pricing.py                       # $/token rates, shared by both reports below
 ├── report_style.py                  # shared HTML/CSS + chart helpers for both reports
@@ -548,6 +608,7 @@ coding-agent-cli/
 ├── scripts/
 │   └── make_demo_gif.py             # regenerates docs/demo.gif (pip install pillow)
 ├── logs/                             # gitignored - events.jsonl and generated reports land here
+├── sessions/                          # gitignored - one <session_id>.json per saved conversation
 ├── requirements.txt
 ├── .env.example
 ├── WORKLOG.md                        # dated log of what changed and why
@@ -560,9 +621,6 @@ These are absent because adding them would turn a project meant to be
 readable end-to-end into a second, larger project - not because they were
 missed:
 
-- **No persistence.** Conversation history lives in a single in-memory
-  list and is gone the moment the process exits. There's no session file,
-  no resume.
 - **No context management.** Long sessions will eventually hit the model's
   context window with no compaction or trimming strategy in place.
 - **No MCP client.** This harness only calls the two hardcoded local tools

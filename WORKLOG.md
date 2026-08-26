@@ -6,6 +6,52 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-26 - Session persistence and resume
+
+- Added [`session_store.py`](./session_store.py): saves the `messages`
+  list to `sessions/<session_id>.json` (gitignored) after every
+  *completed* turn, never mid-turn - the same "only persist a clean
+  state" principle the budget guardrail already used. `main.py` gets
+  `--resume` (most recent session, or a specific `--resume <id>`) and
+  `--list` (see what's resumable).
+- The tricky part wasn't the file I/O, it was that `message.content` from
+  the API is a list of typed SDK objects, not plain dicts - added
+  `assistant_turn()` in `main.py`, using `model_dump(mode="json",
+  exclude_unset=True)` to convert it once, so `messages` stays uniformly
+  JSON-serializable everywhere.
+- **A real bug found only by actually resuming a real saved session**,
+  not by unit-testing the mechanism in isolation: without
+  `exclude_unset=True`, a resumed conversation's second API call failed
+  with `Extra inputs are not permitted` - response objects carry optional
+  fields (e.g. `citations`) that default to `None` and were never
+  actually set; plain `model_dump()` serializes them as explicit nulls
+  anyway, which the *request* schema rejects outright. `exclude_unset`
+  drops anything that was never really there, matching what the SDK
+  itself sends when you pass the typed objects straight through instead
+  of a dict - see `assistant_turn()`'s docstring. Caught because the
+  verification step was "start a second real process and actually resume
+  a real saved conversation," not "confirm the file round-trips through
+  json.dumps/json.loads" (which had already passed, and which is why this
+  didn't get caught earlier).
+- The budget guardrail's `session_cost_usd` deliberately does *not*
+  persist across a `--resume` - it's a per-process cap meant to catch one
+  runaway run, not a lifetime allowance for a conversation you might
+  resume many times. Updated the comments that used to justify the reset
+  as "no persistence exists yet," since that reasoning is gone now.
+- README: new "Resuming a session" section, the "No persistence" Known
+  limitations bullet removed, a `Sessions` node added to the architecture
+  diagram (a genuine two-way dotted edge - the one exception to "Logs is
+  the only side-channel"), and the Usage transcript example fixed to
+  actually match current output (it was already missing the budget-guardrail
+  banner line from two sessions ago - fixed both at once).
+- Verified for real, across genuinely separate processes: created a file
+  in process 1, exited, started a brand new process 2 with `--resume`,
+  and asked it to recall exactly what it had created - it answered
+  correctly from the resumed history, not from anything still in memory.
+  Also checked `--list`, `--resume <bad-id>`, `--resume` with zero saved
+  sessions, and the root-mismatch warning (by deliberately copying a
+  session file into a different directory).
+
 ## 2026-08-24 - Fixed the Haiku adaptive-thinking bug
 
 - `main.py` requested `thinking={"type": "adaptive"}` on every call
