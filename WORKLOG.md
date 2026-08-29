@@ -6,6 +6,32 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-29 - CI: unit tests on every push, evals stay manual
+
+- Added `.github/workflows/ci.yml` with two jobs:
+  - `unit-tests` runs `python -m unittest discover -s tests` on every push
+    and pull request. No `pip install` step - `tools.py` and
+    `tests/test_tools.py` only import the standard library, so the job
+    doesn't need `requirements.txt` at all. Verified this claim for real,
+    not just by reading imports: ran the suite inside a fresh venv built
+    with `python3 -m venv --without-pip` (so `anthropic` and
+    `python-dotenv` genuinely could not be installed) and it still passed
+    26/26.
+  - `evals` runs `evals/run_evals.py` only on a manual `workflow_dispatch`
+    trigger, gated behind an `ANTHROPIC_API_KEY` repo secret - it never
+    runs on push or PR, since it makes real, billed API calls. Without the
+    secret set the job still runs but fails on its first API call, which
+    is documented as expected rather than a workflow bug.
+- Validated `ci.yml` actually parses as YAML (`yaml.safe_load`) before
+  committing, not just eyeballed it.
+- Updated README.md: added a new "Tests and CI" section (a table
+  contrasting what each suite checks, needs, costs, and runs on) right
+  after "Measuring accuracy"; removed the now-closed "No CI" bullet from
+  Known limitations entirely (nothing coherent was left to say there once
+  CI existed); fixed a now-stale claim in "Measuring accuracy" that said
+  the eval harness "isn't wired into CI" - it now is, as the manual job;
+  added `.github/workflows/ci.yml` to the Project layout tree.
+
 ## 2026-08-26 - Unit tests for `tools.py`, in isolation
 
 - Added `tests/test_tools.py` (stdlib `unittest`, no new dependency) - 26

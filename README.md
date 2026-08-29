@@ -453,9 +453,11 @@ which is more useful than pretending there's a single number:
   tool-call count, token usage, and duration shown in the report.
 - Run it: `python evals/run_evals.py`. It needs a real `ANTHROPIC_API_KEY`
   and makes several real API calls - it costs actual money and time, which
-  is exactly why it isn't wired into CI, the same way the sibling
+  is why its [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) job
+  is manual-only (`workflow_dispatch` from the Actions tab, gated behind an
+  `ANTHROPIC_API_KEY` repo secret), the same way the sibling
   `github-repo-mcp-server` project in this account keeps its one live-API
-  smoke test manual-only.
+  smoke test manual-only. It never runs on a push or a pull request.
 - "Accuracy" here = `pass_count / total_count`. Simple and deterministic,
   and only as good as the 4 tasks it happens to check - extending it means
   writing another `check()` function in that file, not touching the
@@ -498,6 +500,24 @@ which is more useful than pretending there's a single number:
 - *Human review at scale.* Fine for grading 4 tasks by hand while writing
   them; doesn't scale past that without either LLM-as-judge or a much
   larger library of still-deterministic `check()` functions.
+
+## Tests and CI
+
+Two suites, two very different costs, so they're wired up differently in
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
+
+| | [`tests/test_tools.py`](./tests/test_tools.py) | [`evals/run_evals.py`](./evals/run_evals.py) |
+|---|---|---|
+| What it checks | `tools.py`'s functions, called directly | The whole CLI, end to end, via a real model |
+| Needs | Nothing - stdlib `unittest` only | `ANTHROPIC_API_KEY`, real API calls |
+| Cost | Free, ~0.1s | Real money and time |
+| Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
+| Run locally | `python -m unittest discover -s tests` | `python evals/run_evals.py` |
+
+The eval job needs an `ANTHROPIC_API_KEY` repo secret (Settings -> Secrets
+and variables -> Actions) to do anything useful - without one it still
+runs, but fails on its first API call, which is the expected outcome for a
+repo that hasn't set one up, not a broken workflow.
 
 ## Setup
 
@@ -624,6 +644,9 @@ coding-agent-cli/
 │   └── history.jsonl                 # gitignored - one line per run_evals.py run
 ├── tests/
 │   └── test_tools.py                 # unit tests for tools.py's functions, in isolation
+├── .github/
+│   └── workflows/
+│       └── ci.yml                     # unit tests on every push; evals, manual only (see Tests and CI)
 ├── docs/
 │   └── demo.gif                     # the animated session in the Demo section
 ├── scripts/
@@ -646,17 +669,6 @@ missed:
   context window with no compaction or trimming strategy in place.
 - **No MCP client.** This harness only calls the two hardcoded local tools
   - it doesn't speak the Model Context Protocol to reach anything external.
-- **No CI.** [`evals/run_evals.py`](./evals/run_evals.py) covers 4
-  end-to-end tasks against the real CLI (see
-  [Measuring accuracy](#measuring-accuracy)), and
-  [`tests/test_tools.py`](./tests/test_tools.py) covers `tools.py`'s
-  individual functions in isolation with stdlib `unittest` - path
-  confinement (including a symlink that physically sits inside the
-  project root but points outside it), `str_replace`'s zero/multiple-match
-  error paths, bash approval/decline/timeout/truncation - all fast and
-  free, no API key or subprocess needed (`python -m unittest discover -s
-  tests`). What's still missing is anything that runs either suite
-  automatically on push - both stay opt-in, run by hand before a commit.
 - **No sub-agents, no parallelism beyond one turn's tool calls.** One
   conversation, one model, one thread of control.
 
