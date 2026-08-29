@@ -6,6 +6,45 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-29 - Tool-call success/decline rate in the session report
+
+- `session_report.py` gained a new `tool_call_stats()` function and a
+  "Tool call outcomes" section, closing the two "signals already sitting
+  in the logs, not yet turned into a report" items the README used to
+  just describe: tool-call success rate and decline rate.
+- Each `tool_call` event is classified as `ok` (`looks_successful` is
+  true), `declined` (not successful, and `result_preview` starts with one
+  of the two fixed decline strings from `tools.py` -
+  `"Command declined"`/`"Edit declined"`), or `error` (not successful, not
+  a decline). Declines are further only counted against `prompted` calls
+  (total minus `view` calls, which never go through an approval gate) for
+  the decline-rate denominator - counting `view` calls there would
+  understate how often you're actually saying "N" to something that could
+  have been declined.
+- The report shows 4 new stat tiles (success rate, decline rate, error
+  count, total calls) plus a stacked ok/declined/error bar per tool name
+  (`bash` vs `str_replace_based_edit_tool`), reusing `report_style.py`'s
+  existing `stat_row`/`bar_row`/`legend` - no new visual language.
+- **Verified against a real, live session, not synthetic data**: ran
+  `python main.py` (Haiku, throwaway dir) through five single-tool-call
+  turns designed to hit every classification bucket - an approved bash
+  call, a declined bash call, an approved file create, a declined file
+  create, and a `view` of a nonexistent file (a genuine error) - then ran
+  `session_report.py` against the real resulting `logs/events.jsonl` and
+  confirmed the numbers by hand: 2 ok, 2 declined, 1 error out of 5 total
+  (40% success, 50% decline rate of 4 prompted calls, matching exactly).
+  Rendered the actual HTML through headless Chromium and read the
+  screenshot to confirm the new section, tiles, legend, and per-tool bars
+  actually look right, not just that the script exited 0.
+- Also checked the zero-tool-call edge case directly (a session with
+  turns but no tool calls) - renders its existing empty-state message
+  instead of a division-by-zero.
+- Updated README.md: replaced the "signals already sitting in the logs"
+  bullets for these two with an "Implemented" write-up in
+  [Measuring accuracy](#measuring-accuracy), and updated the
+  `session_report.py` description under Observability to mention the new
+  section.
+
 ## 2026-08-29 - An approval gate on file edits, not just bash
 
 - `handle_text_editor()` in `tools.py` now gates the three mutating

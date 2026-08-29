@@ -2,7 +2,9 @@
 session_report.py
 ------------------
 Turns one session's worth of logs/events.jsonl into an HTML report:
-token usage and estimated cost, broken down turn by turn.
+token usage and estimated cost, broken down turn by turn, plus a
+tool-call outcome breakdown (success rate, decline rate) for the session
+as a whole.
 
 logs/events.jsonl accumulates across every `python main.py` run - it's
 not truncated between them - so "one session" means one run, identified
@@ -27,6 +29,14 @@ from report_style import bar_row, chip, empty_state, legend, page, section, stat
 
 EVENTS_PATH = Path("logs") / "events.jsonl"
 REPORT_PATH = Path("logs") / "session_report.html"
+
+# The two fixed decline strings tools.py returns - see _confirm_bash() and
+# _confirm_edit() there. A tool_call event's result_preview starts with one
+# of these exactly when the human said "N" at the approval prompt; this is
+# how declines get told apart from ordinary errors below. Kept as a tuple
+# here (not imported from tools.py) so this report has no dependency on
+# main.py's process actually running - it only ever reads the JSONL log.
+_DECLINE_PREFIXES = ("Command declined", "Edit declined")
 
 
 def load_events() -> list[dict]:
@@ -104,11 +114,105 @@ def build_turns(events: list[dict]) -> list[dict]:
     return turns
 
 
+def tool_call_stats(events: list[dict]) -> dict:
+    """Reduce a session's tool_call events to outcome counts, overall and
+    per tool name - the "signals already sitting in the logs" the README
+    used to just describe instead of reporting.
+
+    Each tool_call event carries `looks_successful` (main.py's own
+    heuristic - see its comment there for what it does and doesn't
+    guarantee) and a `result_preview`. A call is classified as:
+
+        ok       - looks_successful is True
+        declined - not successful, and result_preview starts with one of
+                   the fixed decline strings (a human said "N")
+        error    - not successful, and it wasn't a decline (a real
+                   failure: bad path, str_replace with the wrong number of
+                   matches, a bash exit, a timeout, ...)
+
+    `view` calls (read-only - see tools.py) never go through an approval
+    gate, so they can never be "declined"; they're tracked in `by_tool`
+    like anything else but excluded from `prompted`, which is the
+    denominator decline rate should actually use - counting view calls in
+    it would understate how often you're saying "N" to things that could
+    have been declined.
+    """
+    stats = {
+        "total": 0,
+        "ok": 0,
+        "declined": 0,
+        "error": 0,
+        "prompted": 0,  # calls that went through *some* approval gate
+        "by_tool": defaultdict(lambda: {"total": 0, "ok": 0, "declined": 0, "error": 0}),
+    }
+    for e in events:
+        if e["event"] != "tool_call":
+            continue
+        tool_name = e.get("tool_name", "?")
+        call = e.get("call", "")
+        is_view = tool_name == "str_replace_based_edit_tool" and call.startswith("view ")
+
+        if e.get("looks_successful"):
+            outcome = "ok"
+        elif str(e.get("result_preview", "")).startswith(_DECLINE_PREFIXES):
+            outcome = "declined"
+        else:
+            outcome = "error"
+
+        stats["total"] += 1
+        stats[outcome] += 1
+        if not is_view:
+            stats["prompted"] += 1
+        stats["by_tool"][tool_name]["total"] += 1
+        stats["by_tool"][tool_name][outcome] += 1
+    stats["by_tool"] = dict(stats["by_tool"])  # plain dict - defaultdict was just for the loop above
+    return stats
+
+
 def fmt_cost(v) -> str:
     return f"${v:.4f}" if v is not None else "—"
 
 
-def render_report(session_id: str, turns: list[dict]) -> str:
+def _pct(numerator: int, denominator: int) -> str:
+    return f"{numerator / denominator:.0%}" if denominator else "—"
+
+
+def render_tool_stats_section(tool_stats: dict) -> str:
+    """The 'signals already sitting in the logs' section: overall success
+    and decline rate, plus a per-tool-name breakdown bar (ok/declined/error,
+    stacked) - see tool_call_stats() above for how each call is classified."""
+    total = tool_stats["total"]
+    if total == 0:
+        return section("Tool call outcomes", "", empty_state("No tool calls in this session yet."))
+
+    tiles = stat_row(
+        [
+            ("Success rate", _pct(tool_stats["ok"], total), f"{tool_stats['ok']}/{total} calls"),
+            (
+                "Decline rate",
+                _pct(tool_stats["declined"], tool_stats["prompted"]),
+                f"{tool_stats['declined']}/{tool_stats['prompted']} prompted calls"
+                if tool_stats["prompted"]
+                else "no prompted calls (view-only session)",
+            ),
+            ("Errors", str(tool_stats["error"]), _pct(tool_stats["error"], total) + " of all calls"),
+            ("Total calls", str(total), f"{tool_stats['prompted']} were prompted for approval"),
+        ]
+    )
+
+    colors = [("ok", "var(--good)"), ("declined", "var(--orange)"), ("error", "var(--critical)")]
+    bars = legend(
+        [(label, color) for label, color in colors if any(t[label] for t in tool_stats["by_tool"].values())]
+    )
+    max_calls = max((t["total"] for t in tool_stats["by_tool"].values()), default=1)
+    for tool_name, counts in sorted(tool_stats["by_tool"].items(), key=lambda kv: -kv[1]["total"]):
+        segments = [(counts[label], color) for label, color in colors if counts[label]]
+        bars += bar_row(tool_name, segments, max_calls, str(counts["total"]))
+
+    return section("Tool call outcomes", f"{total} tool call(s)", tiles + bars)
+
+
+def render_report(session_id: str, turns: list[dict], tool_stats: dict) -> str:
     total_in = sum(t["input_tokens"] for t in turns)
     total_out = sum(t["output_tokens"] for t in turns)
     total_tools = sum(t["tool_calls"] for t in turns)
@@ -161,7 +265,7 @@ def render_report(session_id: str, turns: list[dict]) -> str:
             f"</tr></thead><tbody>{rows}</tbody></table></div>"
         )
         table_section = section("Turn detail", t["model"] or "", table)
-        body = tiles + chart_section + table_section
+        body = tiles + chart_section + render_tool_stats_section(tool_stats) + table_section
 
     footer = (
         "Costs are estimates from <span class=\"mono\">pricing.py</span>'s point-in-time "
@@ -204,9 +308,10 @@ def main() -> None:
 
     session_events = [e for e in events if e["session_id"] == session_id]
     turns = build_turns(session_events)
+    tool_stats = tool_call_stats(session_events)
 
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(render_report(session_id, turns), encoding="utf-8")
+    REPORT_PATH.write_text(render_report(session_id, turns, tool_stats), encoding="utf-8")
     print(f"Wrote {REPORT_PATH} ({len(turns)} turn(s) in session {session_id})")
     if len(sessions) > 1:
         print(f"({len(sessions) - 1} other session(s) in the log - see --all)")

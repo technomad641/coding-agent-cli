@@ -389,11 +389,13 @@ python session_report.py --session <id>  # a specific one
 It writes `logs/session_report.html` - stat tiles for the session (turns,
 estimated cost, total tokens, tool calls), a per-turn bar chart splitting
 input vs. output tokens with the estimated cost of each turn labeled
-alongside it, and a detail table. A turn that errored out shows as a red
-bar and a `FAIL` status instead of being silently dropped from the report.
-Dollar figures come from [`pricing.py`](./pricing.py) - a small, hardcoded,
-point-in-time rate table (documented there as exactly that: an estimate,
-not your invoice).
+alongside it, a tool-call outcomes section (success rate, decline rate,
+and an ok/declined/error breakdown per tool - see
+[Measuring accuracy](#measuring-accuracy)), and a detail table. A turn
+that errored out shows as a red bar and a `FAIL` status instead of being
+silently dropped from the report. Dollar figures come from
+[`pricing.py`](./pricing.py) - a small, hardcoded, point-in-time rate
+table (documented there as exactly that: an estimate, not your invoice).
 
 ### Stopping before it gets expensive: the budget guardrail
 
@@ -493,17 +495,27 @@ which is more useful than pretending there's a single number:
   - a single run also renders fine, just with a note that the trend charts
   need a second data point).
 
-**Signals already sitting in the logs, not yet turned into a report:**
-- *Tool-call success rate* - `tool_call` events already carry a
-  `looks_successful` heuristic; aggregating it across a session would give
-  "% of tool calls that didn't error," a cheap proxy for how often the
-  model's actions actually work.
-- *Decline rate* - how often you say `N` at the bash approval prompt. A
-  model whose proposed commands you keep declining is proposing the wrong
-  action, which is a real accuracy signal, and it's already visible by
-  grepping the logs for the decline result text.
+**Implemented: tool-call outcomes, per session (in [`session_report.py`](./session_report.py))**
+- Every `session_report.py` run now includes a "Tool call outcomes"
+  section: success rate (`looks_successful` - see `main.py` - aggregated
+  across the session, "% of tool calls that didn't error"), decline rate
+  (how often you said `N` at an approval prompt, out of calls that could
+  actually be declined - `view` never prompts, so it's excluded from that
+  denominator), and a per-tool-name breakdown bar (`bash` vs
+  `str_replace_based_edit_tool`, each split into ok/declined/error).
+- `tool_call_stats()` classifies each `tool_call` event by
+  `looks_successful` plus whether its `result_preview` starts with one of
+  the two fixed decline strings (`_confirm_bash()`/`_confirm_edit()` in
+  `tools.py`) - a model whose proposed actions you keep declining is
+  proposing the wrong thing, which is a real accuracy signal distinct from
+  "did it error."
+
+**Not yet turned into a report:**
 - *Tool calls per task, over time* - more loop iterations to do the same
   kind of task can mean the model is thrashing, not being more thorough.
+  Would need the same kind of cross-run history `evals/history.jsonl`
+  already gives the eval harness, which nothing analogous currently
+  builds for ordinary sessions.
 
 **Not implemented - a real next step, not something this project needed to cover:**
 - *LLM-as-judge.* Have a separate Claude call read the full transcript and
