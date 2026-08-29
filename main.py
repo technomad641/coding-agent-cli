@@ -345,11 +345,12 @@ def run_turn(trace_id: str, user_input: str) -> None:
                     call=preview(describe_call(block.name, block.input), 120),
                     duration_ms=tool_timer.ms,
                     # A heuristic, not a guarantee: our own tool handlers
-                    # only ever start a failure or a decline with "Error"
-                    # or the fixed decline string - see tools.py. Good
-                    # enough to spot a rough success rate at a glance;
-                    # don't treat it as a verified pass/fail signal.
-                    looks_successful=not result.startswith(("Error", "Command declined")),
+                    # only ever start a failure or a decline with "Error",
+                    # or one of the two fixed decline strings (bash and the
+                    # text editor's create/str_replace/insert gate) - see
+                    # tools.py. Good enough to spot a rough success rate at
+                    # a glance; don't treat it as a verified pass/fail signal.
+                    looks_successful=not result.startswith(("Error", "Command declined", "Edit declined")),
                     result_preview=preview(result),
                 )
                 tool_results.append(

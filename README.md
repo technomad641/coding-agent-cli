@@ -240,7 +240,10 @@ explaining:
   instead of guessing which occurrence was meant - a smaller, more
   reviewable diff surface than "here's the new file contents, trust me."
 - **The guardrail:** every path is resolved and confined to the project
-  root before any filesystem call runs (see [Threat model](#threat-model)).
+  root before any filesystem call runs, and every mutating command
+  (`create`/`str_replace`/`insert`) is printed and requires an explicit
+  `y` before it writes - `view` is read-only and never prompts (see
+  [Threat model](#threat-model)).
 
 ## Threat model
 
@@ -264,6 +267,13 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
 - *Unattended shell execution* → every bash command is printed and
   requires an explicit `y` before it runs. This is the primary control,
   not a backstop.
+- *Unattended file writes* → every mutating text-editor command
+  (`create`/`str_replace`/`insert`) is printed and requires an explicit
+  `y` before it writes, the same shape as the bash gate above but gated
+  by its own `AUTO_APPROVE_EDITS` (not `AUTO_APPROVE_BASH`) since they're
+  separate trust decisions. `view` is read-only and never prompts -
+  gating it too would make the tool useless for the model's normal
+  look-before-you-edit habit, for no safety benefit (`view` can't write).
 
 **Partially mitigated**
 - *Prompt injection via tool output.* A file the model reads, or a
@@ -298,6 +308,11 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
 - *`AUTO_APPROVE_BASH=true` removes that gate entirely.* If you set it,
   you are personally taking on the role the allowlist would otherwise
   play - only do this in a directory you'd hand unattended shell access to.
+- *`AUTO_APPROVE_EDITS=true` removes the file-write gate the same way.*
+  Same reasoning as `AUTO_APPROVE_BASH` above, kept as a separate switch
+  on purpose - you might reasonably trust an agent to rewrite files in a
+  repo you're actively supervising while still wanting to eyeball every
+  shell command it runs, or vice versa.
 - *No sandboxing.* No container, no VM, no seccomp profile. `bash` runs
   with your real user's permissions in your real shell environment. Path
   confinement only covers the *editor* tool - an approved bash command can
@@ -544,6 +559,12 @@ type a task, or "exit" to quit
 > add a .gitignore for a node project
 
 [str_replace_based_edit_tool] create .gitignore
+
+  write .gitignore (25 chars):
+  node_modules/
+dist/
+.env
+  allow? [y/N] y
 Created .gitignore
 
 Done - added a .gitignore covering node_modules, dist, and .env.
@@ -625,6 +646,7 @@ see `session_store.py`'s module docstring for why.
 | `CLAUDE_MODEL` | `claude-opus-5` | Model ID to use for every request. Adaptive thinking is only requested for models that support it (`MODELS_WITH_ADAPTIVE_THINKING` in `main.py`) - anything else, including Haiku-tier models, runs without it instead of erroring. |
 | `MAX_TOKENS` | `8192` | Per-response token ceiling. Raised responses cost more and take longer to stream; lowered ones risk mid-thought truncation (the CLI will tell you when this happens). |
 | `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
+| `AUTO_APPROVE_EDITS` | `false` | Skip the y/n prompt before every file write (`create`/`str_replace`/`insert`; `view` never prompts). Kept independent of `AUTO_APPROVE_BASH` - see [Threat model](#threat-model). |
 | `SESSION_BUDGET_USD` | `1.00` | Stop the session once its estimated cost reaches this. `0` disables it. See [Observability](#observability). |
 
 ## Project layout

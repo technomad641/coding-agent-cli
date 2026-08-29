@@ -130,6 +130,13 @@ def _confirm_bash(command: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Commands that actually write to disk - these are the ones that need
+# approval. "view" is read-only and never prompts; prompting on every read
+# would make the tool useless for the model's normal "look before you leap"
+# habit of viewing a file before editing it.
+_MUTATING_EDIT_COMMANDS = {"create", "str_replace", "insert"}
+
+
 def handle_text_editor(tool_input: dict, root: Path) -> str:
     """Dispatch to the right file operation based on tool_input["command"]."""
     command = tool_input.get("command", "")
@@ -142,6 +149,11 @@ def handle_text_editor(tool_input: dict, root: Path) -> str:
 
         if command == "view":
             return _view(path, tool_input.get("view_range"))
+
+        if command in _MUTATING_EDIT_COMMANDS:
+            if not _confirm_edit(_describe_edit(command, raw_path, tool_input)):
+                return "Edit declined by the user - not written."
+
         if command == "create":
             return _create(path, tool_input.get("file_text", ""), raw_path)
         if command == "str_replace":
@@ -157,6 +169,50 @@ def handle_text_editor(tool_input: dict, root: Path) -> str:
         # becomes a tool_result Claude can read and react to, instead of
         # crashing the whole CLI over one bad file operation.
         return f"Error: {err}"
+
+
+def _confirm_edit(summary: str) -> bool:
+    """Ask the human in the loop before writing to the filesystem.
+
+    Mirrors _confirm_bash() below - same AUTO_APPROVE_* pattern, but a
+    separate env var (AUTO_APPROVE_EDITS, not AUTO_APPROVE_BASH), since
+    trusting the model to run shell commands unattended and trusting it to
+    write files unattended are different decisions - see the README's
+    Threat model for why they're kept independent.
+    """
+    if os.environ.get("AUTO_APPROVE_EDITS") == "true":
+        return True
+    answer = input(f"\n  {summary}\n  allow? [y/N] ")
+    return answer.strip().lower() == "y"
+
+
+def _truncate(text: str, limit: int = 400) -> str:
+    """Shorten text shown at the approval prompt so one huge file_text
+    doesn't scroll the actual question off the terminal."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... ({len(text) - limit} more chars)"
+
+
+def _describe_edit(command: str, raw_path: str, tool_input: dict) -> str:
+    """Build the human-readable summary shown at the approval prompt -
+    enough to decide without having to go open the file separately."""
+    if command == "create":
+        file_text = tool_input.get("file_text", "")
+        return f"write {raw_path} ({len(file_text)} chars):\n  {_truncate(file_text)}"
+    if command == "str_replace":
+        old_str = tool_input.get("old_str", "")
+        new_str = tool_input.get("new_str", "")
+        return (
+            f"edit {raw_path}:\n"
+            f"  - {_truncate(old_str, 200)}\n"
+            f"  + {_truncate(new_str, 200)}"
+        )
+    if command == "insert":
+        insert_text = tool_input.get("insert_text", "")
+        insert_line = tool_input.get("insert_line", 0)
+        return f"insert into {raw_path} after line {insert_line}:\n  {_truncate(insert_text)}"
+    return f"{command} {raw_path}"  # unreachable given _MUTATING_EDIT_COMMANDS, kept as a safe fallback
 
 
 def _view(path: Path, view_range: list | None) -> str:

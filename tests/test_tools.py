@@ -100,11 +100,22 @@ class ResolveWithinRootTests(unittest.TestCase):
 
 class TextEditorTests(unittest.TestCase):
     """handle_text_editor() and the _view/_create/_str_replace/_insert
-    helpers it dispatches to."""
+    helpers it dispatches to.
+
+    Every mutating command (create/str_replace/insert) now goes through an
+    approval gate the same shape as handle_bash()'s - see
+    ApprovalGateTests below for that gate's own behavior. Here,
+    AUTO_APPROVE_EDITS is patched on for the whole class so these tests can
+    focus on what each command actually does to the filesystem, the same
+    way BashTests patches AUTO_APPROVE_BASH on for its "does the command
+    run correctly" tests."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.root = Path(self._tmpdir.name).resolve()
+        self._env_patcher = patch.dict("os.environ", {"AUTO_APPROVE_EDITS": "true"})
+        self._env_patcher.start()
+        self.addCleanup(self._env_patcher.stop)
 
     def tearDown(self):
         self._tmpdir.cleanup()
@@ -197,6 +208,85 @@ class TextEditorTests(unittest.TestCase):
         )
         self.assertTrue(result.startswith("Error: "))
         self.assertIn("outside the project root", result)
+
+
+class EditApprovalGateTests(unittest.TestCase):
+    """The approval gate in front of create/str_replace/insert - separate
+    from TextEditorTests above, which patches AUTO_APPROVE_EDITS on so it
+    can test what each command *does*. These tests are about the gate
+    itself: that view never triggers it, that a decline leaves the
+    filesystem untouched, and that an approval lets the write through."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    @patch.dict("os.environ", {}, clear=False)
+    @patch("builtins.input", return_value="n")
+    def test_create_declined_is_not_written(self, mock_input):
+        import os as _os
+
+        _os.environ.pop("AUTO_APPROVE_EDITS", None)
+        result = tools.handle_text_editor(
+            {"command": "create", "path": "new.txt", "file_text": "hello"}, self.root
+        )
+        self.assertEqual(result, "Edit declined by the user - not written.")
+        self.assertFalse((self.root / "new.txt").exists())
+        mock_input.assert_called_once()
+
+    @patch.dict("os.environ", {}, clear=False)
+    @patch("builtins.input", return_value="n")
+    def test_str_replace_declined_leaves_file_untouched(self, mock_input):
+        import os as _os
+
+        _os.environ.pop("AUTO_APPROVE_EDITS", None)
+        (self.root / "f.txt").write_text("hello world")
+        result = tools.handle_text_editor(
+            {"command": "str_replace", "path": "f.txt", "old_str": "world", "new_str": "there"},
+            self.root,
+        )
+        self.assertEqual(result, "Edit declined by the user - not written.")
+        self.assertEqual((self.root / "f.txt").read_text(), "hello world")
+
+    @patch.dict("os.environ", {}, clear=False)
+    @patch("builtins.input", return_value="y")
+    def test_create_approved_is_written(self, mock_input):
+        import os as _os
+
+        _os.environ.pop("AUTO_APPROVE_EDITS", None)
+        result = tools.handle_text_editor(
+            {"command": "create", "path": "new.txt", "file_text": "hello"}, self.root
+        )
+        self.assertEqual(result, "Created new.txt")
+        self.assertEqual((self.root / "new.txt").read_text(), "hello")
+        mock_input.assert_called_once()
+
+    @patch.dict("os.environ", {}, clear=False)
+    @patch("builtins.input")
+    def test_view_never_prompts(self, mock_input):
+        # view is read-only - it must not go anywhere near _confirm_edit().
+        # If it did, this mocked input() (which returns a MagicMock, not
+        # "y"/"n") would make that obvious; asserting not-called is the
+        # direct check.
+        import os as _os
+
+        _os.environ.pop("AUTO_APPROVE_EDITS", None)
+        (self.root / "f.txt").write_text("one\ntwo")
+        result = tools.handle_text_editor({"command": "view", "path": "f.txt"}, self.root)
+        self.assertEqual(result, "1\tone\n2\ttwo")
+        mock_input.assert_not_called()
+
+    @patch.dict("os.environ", {"AUTO_APPROVE_EDITS": "true"})
+    def test_auto_approve_edits_skips_the_prompt(self):
+        # No input() mock at all - if the gate tried to prompt, this would
+        # hang or raise, not silently pass.
+        result = tools.handle_text_editor(
+            {"command": "create", "path": "new.txt", "file_text": "hi"}, self.root
+        )
+        self.assertEqual(result, "Created new.txt")
 
 
 class BashTests(unittest.TestCase):

@@ -6,6 +6,57 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-29 - An approval gate on file edits, not just bash
+
+- `handle_text_editor()` in `tools.py` now gates the three mutating
+  commands - `create`, `str_replace`, `insert` - behind the same y/n
+  approval shape as `handle_bash()`'s `_confirm_bash()`, via a new
+  `_confirm_edit()`. `view` is read-only and was deliberately left
+  unprompted - gating it would break the model's normal
+  look-before-you-edit habit for no safety benefit, since it can't write.
+  Declining returns `"Edit declined by the user - not written."` and the
+  file is genuinely untouched. Controlled by a new `AUTO_APPROVE_EDITS`
+  env var, kept independent of `AUTO_APPROVE_BASH` on purpose - trusting
+  unattended shell access and trusting unattended file writes are
+  different decisions.
+- The approval prompt itself (`_describe_edit()`) shows enough to decide
+  without opening the file separately: for `create`, the path, byte count,
+  and a truncated preview of the new content; for `str_replace`, the
+  path plus a truncated old/new pair; for `insert`, the path, target line,
+  and truncated inserted text. A `_truncate()` helper caps any of these at
+  a few hundred chars so one huge `file_text` can't scroll the actual y/N
+  question off the terminal.
+- **Verified three ways, all against the real, live model** (not just
+  unit tests) via `python main.py` in throwaway directories with
+  `CLAUDE_MODEL=claude-haiku-4-5-20251001` to keep it cheap: (1) declined
+  a real `create` call - the approval prompt showed the exact content
+  about to be written, the file was never created, and the model
+  correctly reported "declined" without retrying; (2) approved a real
+  `create` call - the file landed on disk with the exact requested
+  content; (3) set `AUTO_APPROVE_EDITS=true` and confirmed the prompt was
+  skipped entirely and the file was written straight through.
+- **Found and fixed a real bug while doing that verification, not
+  mechanically**: `main.py`'s `looks_successful` heuristic (used for
+  observability logging) only recognized `"Error"` and `"Command
+  declined"` as failure prefixes - a declined *edit* would have been
+  silently miscounted as a success. Added `"Edit declined"` to the
+  checked prefixes. This surfaced only because the live decline test's
+  terminal transcript was actually read, not assumed correct.
+- `tests/test_tools.py`: added `EditApprovalGateTests` (decline leaves the
+  file untouched, approval writes it, `view` never calls `input()` at
+  all, `AUTO_APPROVE_EDITS=true` skips the prompt) and patched
+  `AUTO_APPROVE_EDITS=true` onto the whole existing `TextEditorTests`
+  class, the same way `BashTests` already patches `AUTO_APPROVE_BASH` on
+  for its "does the command do the right thing" tests. 31 tests total, up
+  from 26, all still free/fast/no-API-key.
+- Updated README.md: Threat model gained a "Mitigated" bullet for
+  unattended file writes and a "Not mitigated - on purpose" bullet for
+  `AUTO_APPROVE_EDITS=true`; the text-editor tool's guardrail line now
+  mentions the gate; added the `AUTO_APPROVE_EDITS` row to the
+  Configuration table; fixed the Usage section's `.gitignore` transcript,
+  which was already stale in the opposite direction (missing the approval
+  prompt it now genuinely produces). Added the same var to `.env.example`.
+
 ## 2026-08-29 - CI: unit tests on every push, evals stay manual
 
 - Added `.github/workflows/ci.yml` with two jobs:
