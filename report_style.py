@@ -1,13 +1,14 @@
 """
 report_style.py
 ----------------
-Shared HTML/CSS shell and small chart helpers for the two generated
-reports in this repo:
+Shared HTML/CSS shell and small chart helpers for the generated reports
+in this repo:
 
     evals/report.py    - accuracy and cost trend across eval runs
     session_report.py  - per-turn token/cost breakdown for one session
+    cost_report.py     - cost across every session, not just one
 
-Factored out so the two reports look like one system instead of two
+Factored out so all of them look like one system instead of several
 different tools, and so a palette/layout change happens in one place.
 Everything here returns plain strings - these functions build up an HTML
 document by string concatenation, no templating engine, so the whole

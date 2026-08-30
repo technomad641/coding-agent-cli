@@ -6,6 +6,65 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-30 - Cross-session cost aggregation: `cost_report.py`
+
+- Closes the "No aggregation across sessions" Observability gap:
+  `session_report.py` deliberately reports on one `python main.py` run at
+  a time - the new `cost_report.py` is the other half, reading every
+  session in `logs/events.jsonl` at once and answering "$ spent this
+  week" without a manual `jq`/`awk` pass.
+- `aggregate()` reduces every `api_call` event to per-session totals
+  (tokens, cost, turn count via `turn_start` events) and a per-day cost
+  bucket, summing cost per call (not from summed tokens) - matching
+  `session_report.py`'s `build_turns()` so the two reports stay
+  consistent if a session ever spans more than one model.
+- Report: stat tiles (total spend, sessions, tokens, unpriced-call count),
+  a cost-by-day bar chart (once there are ≥2 priced days to compare), and
+  a cost-by-session table, newest first. A session with any unpriced
+  model call still shows its tokens, with a trailing **+** on its cost so
+  "$0.0000" can't be misread as "genuinely free" - same fix pattern used
+  in `run_evals.py` for the same ambiguity, applied here from the start.
+- `--days N` narrows the window; `--days 0` or negative is rejected
+  outright at the argparse level rather than silently behaving like "no
+  filter" (which `if args.days:` would otherwise do, since `0` is falsy
+  in Python - a real footgun for a flag that exists specifically to say
+  "how many days").
+- **Verified against real, live, multi-session data**: ran `python
+  main.py` four separate times (real Haiku and Sonnet calls, mixed priced
+  and unpriced) so `logs/events.jsonl` held genuinely distinct
+  `session_id`s, then re-dated one real session's timestamps backward
+  (still real recorded token/cost data, just shifted) to get a second day
+  to chart without fabricating numbers. Confirmed `--days` correctly
+  narrowed the session count, the unpriced "+" marker and the priced
+  no-marker case both rendered right, and read the actual rendered HTML
+  via a headless-Chromium screenshot rather than assuming the script
+  exiting 0 meant it looked right.
+- **That live verification caught a real bug**: the lede read `Estimated
+  spend across the last ['2026-08-30'] day(s)` instead of a sentence - a
+  local variable inside `render_report()` was named `days` (the sorted
+  list of dates with priced cost), shadowing the function's own `days:
+  int | None` parameter before the footer's "last N day(s)" text read it.
+  Fixed by renaming the local to `priced_days`.
+- Added `tests/test_cost_report.py` (10 stdlib `unittest` tests) -
+  `cost_report.py` has no module-level side effects (unlike `main.py`),
+  so it's cleanly importable and testable the same way `tools.py` is.
+  Covers `aggregate()`'s per-session/per-day bucketing and priced/unpriced
+  split, `render_report()`'s actual rendered text (not just "did it
+  raise" - exactly the level that would have caught the shadowing bug
+  above, and two of these tests exist specifically to lock that
+  regression in), and the `--days 0`/negative rejection via a real
+  subprocess invocation of the CLI. Verified the regression tests
+  actually catch the bug by reintroducing it and confirming the right
+  test failed, then reverting and confirming green again. 42 tests total
+  across the suite now (up from 31), still free/fast/no API key.
+- Updated README.md: replaced the "No aggregation across sessions" bullet
+  under Observability's "What this deliberately doesn't do" with a new
+  "\"$ spent this week\": `cost_report.py`" subsection; added the new
+  files to the Project layout tree and the Tests-and-CI table. Fixed two
+  other now-stale docstrings found in passing: `report_style.py` said "the
+  two generated reports" (now three) and `pricing.py`'s docstring named
+  only the two reports that existed when it was written.
+
 ## 2026-08-30 - Context compaction for long sessions
 
 - Closes the "No context management" Known-limitations bullet: the

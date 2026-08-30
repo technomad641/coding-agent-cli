@@ -2,7 +2,8 @@
 pricing.py
 ----------
 Turns the token counts observability.py already logs into an actual
-dollar figure, for evals/report.py and session_report.py.
+dollar figure, for evals/report.py, session_report.py, and
+cost_report.py - and, live, for main.py's own budget guardrail.
 
 This is a point-in-time snapshot, not a live lookup - Anthropic's pricing
 page (https://platform.claude.com/docs/en/about-claude/pricing) or the

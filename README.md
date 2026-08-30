@@ -443,11 +443,33 @@ and "observability" at production scale:
 - No exporting anywhere - the events never leave `logs/events.jsonl`. No
   dashboards, no alerting, no distributed tracing across processes.
 - No retention policy. The file only grows; nothing rotates or caps it.
-- No aggregation *across sessions* - `session_report.py` reports on one
-  `python main.py` run at a time. "$ spent this week" across every session
-  in the log is still a `jq`/`awk` exercise left to you.
 - Pricing is a hardcoded snapshot in `pricing.py`, not a live lookup - see
   that file's own docstring for what to do when it drifts out of date.
+
+### "$ spent this week": `cost_report.py`
+
+`session_report.py` deliberately reports on one `python main.py` run at a
+time - [`cost_report.py`](./cost_report.py) is the other half: every
+session in `logs/events.jsonl`, aggregated.
+
+```bash
+python cost_report.py             # every session ever logged
+python cost_report.py --days 7    # only the last 7 days
+```
+
+It writes `logs/cost_report.html` - total spend, session count, and total
+tokens as stat tiles; a cost-per-day bar chart (once there are at least two
+days with a priced call to compare); and a cost-per-session table, newest
+first. A session whose model has no rate in `pricing.py` still shows its
+token counts, with a trailing **+** on its cost - the true total is higher
+than what's shown, not zero.
+
+`session_id` here means one `python main.py` *process*, the same unit
+`SESSION_BUDGET_USD` caps - resuming a conversation across three separate
+processes shows up as three rows, not one, because that's the level this
+whole codebase already tracks cost at (see [Resuming a session](#resuming-a-session)
+for why the process id and the saved-conversation id are related but not
+the same thing).
 
 ### Keeping a long session going: context compaction
 
@@ -568,9 +590,9 @@ which is more useful than pretending there's a single number:
 Two suites, two very different costs, so they're wired up differently in
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 
-| | [`tests/test_tools.py`](./tests/test_tools.py) | [`evals/run_evals.py`](./evals/run_evals.py) |
+| | [`tests/`](./tests) | [`evals/run_evals.py`](./evals/run_evals.py) |
 |---|---|---|
-| What it checks | `tools.py`'s functions, called directly | The whole CLI, end to end, via a real model |
+| What it checks | `tools.py` and `cost_report.py`'s functions, called directly | The whole CLI, end to end, via a real model |
 | Needs | Nothing - stdlib `unittest` only | `ANTHROPIC_API_KEY`, real API calls |
 | Cost | Free, ~0.1s | Real money and time |
 | Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
@@ -707,14 +729,16 @@ coding-agent-cli/
 ├── observability.py                 # structured JSONL event logging (see Observability)
 ├── session_store.py                 # sessions/<id>.json save + load (see Resuming a session)
 ├── session_report.py                # logs/events.jsonl -> a per-turn token/cost report
-├── pricing.py                       # $/token rates, shared by both reports below
-├── report_style.py                  # shared HTML/CSS + chart helpers for both reports
+├── cost_report.py                    # logs/events.jsonl -> cost across every session
+├── pricing.py                       # $/token rates, shared by every report
+├── report_style.py                  # shared HTML/CSS + chart helpers for every report
 ├── evals/
 │   ├── run_evals.py                  # golden-task accuracy harness (see Measuring accuracy)
 │   ├── report.py                     # evals/history.jsonl -> an accuracy/cost trend report
 │   └── history.jsonl                 # gitignored - one line per run_evals.py run
 ├── tests/
-│   └── test_tools.py                 # unit tests for tools.py's functions, in isolation
+│   ├── test_tools.py                 # unit tests for tools.py's functions, in isolation
+│   └── test_cost_report.py           # unit tests for cost_report.py, in isolation
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                     # unit tests on every push; evals, manual only (see Tests and CI)
