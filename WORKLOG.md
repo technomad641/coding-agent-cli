@@ -6,6 +6,81 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-30 - Context compaction for long sessions
+
+- Closes the "No context management" Known-limitations bullet: the
+  Messages API is stateless (the entire `messages` list is resent on
+  every call), so a long enough session eventually gets too big for the
+  model's context window and every call after that just fails. `main.py`
+  now watches `last_input_tokens` (tracked by a new shared
+  `track_api_call()`, also used by the main loop and the summarizer call
+  below - one place that logs `api_call` events and enforces the budget
+  guardrail, instead of two copies of that logic) and, once it crosses
+  `CONTEXT_COMPACT_THRESHOLD_TOKENS` (default `160000`), replaces
+  everything except the most recent `CONTEXT_KEEP_RECENT_TURNS` turns
+  (default `4`) with one short, model-written summary.
+- `compute_turn_boundaries()` tells a genuine new-task turn apart from a
+  tool-results continuation purely by shape (a bare string vs. a list of
+  `tool_result` blocks - exactly how `run_turn()` already appends each),
+  so it works the same whether `messages` was built live or reloaded via
+  `--resume` from a session saved before compaction existed - no separate
+  turn-boundary state to keep in sync.
+- `maybe_compact()` only ever runs from the top of `run_turn()`, before
+  the new user message is appended - never mid-turn, where `messages` can
+  have a `tool_use` with no `tool_result` yet. Same "only touch `messages`
+  at a clean boundary" invariant `session_store.py` already relies on for
+  `--resume`. A single turn that blows the context window entirely on its
+  own tool calls isn't caught by this - documented as a real, known
+  limitation, not silently ignored.
+- The summary itself costs one extra, non-streamed, tools-less API call
+  (`_summarize_older_messages()`) - tracked against `SESSION_BUDGET_USD`
+  like any other call, since it's a real cost (roughly what one more turn
+  against the uncompacted history would've cost - paid once so every
+  later call is smaller). The compacted history becomes a synthetic
+  `user`/`assistant` pair (summary + a one-line "understood, continuing")
+  rather than the summary alone, because the API requires the first
+  message to be `user`-role and roles to alternate - a lone assistant-role
+  summary couldn't lead the list.
+- **Verified in three stages, the same discipline as every other
+  behavior-changing feature in this project:**
+  1. Pure logic (`compute_turn_boundaries`, the threshold/keep-count
+     no-op guards) checked directly against hand-built message lists - no
+     API involved.
+  2. The full restructuring path checked with `client.messages.create`
+     mocked (`unittest.mock.patch.object`) - confirmed the summarizer
+     request excludes `tools`, and the exact right span gets cut and
+     replaced while the kept-recent turns stay byte-for-byte untouched.
+  3. **Real, live runs** (`python main.py`, Haiku, throwaway dirs,
+     `CONTEXT_COMPACT_THRESHOLD_TOKENS` set low to force it cheaply): told
+     the model a fact in turn 1, asked an unrelated filler question in
+     turn 2, then asked for the fact back in turn 3 - compaction fired
+     before turn 3 (summarizing turn 1 away) and the model *still*
+     answered correctly, proving the summary actually preserved what
+     mattered, not just that the mechanism fired. Also confirmed the
+     resulting saved session resumes cleanly in a genuinely separate
+     process and the conversation continues normally.
+  - **That live verification caught a real bug**, not mechanically: the
+    logged `context_compaction` event's `last_input_tokens` field showed
+    the *summarizer's own* (tiny) input token count instead of the value
+    that actually triggered compaction, because `_summarize_older_messages()`
+    routes through the same `track_api_call()` that overwrites the
+    module-level `last_input_tokens` - only visible by actually reading a
+    real logged event, not assumed correct. Fixed by capturing the
+    triggering value into a local variable before making that call.
+- No unit tests added for this (`tests/test_tools.py` covers `tools.py`
+  only, by design - see its own docstring); `main.py` has never had a
+  unit-test file, since importing it standalone triggers real module-level
+  side effects (argparse consuming `sys.argv`, constructing a live
+  `anthropic.Anthropic` client) that would need a real refactor to make
+  safely importable. Every `main.py`-level feature so far (budget
+  guardrail, session persistence, prompt injection, edit approval) has
+  been verified the same way: real live runs, not unit tests.
+- Updated README.md: rewrote the "No context management" Known-limitations
+  bullet to describe the one real gap that's left (a single oversized
+  turn); added a "Keeping a long session going: context compaction"
+  subsection under Observability; added both new env vars to the
+  Configuration table and `.env.example`.
+
 ## 2026-08-29 - Tool-call success/decline rate in the session report
 
 - `session_report.py` gained a new `tool_call_stats()` function and a

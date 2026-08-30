@@ -449,6 +449,41 @@ and "observability" at production scale:
 - Pricing is a hardcoded snapshot in `pricing.py`, not a live lookup - see
   that file's own docstring for what to do when it drifts out of date.
 
+### Keeping a long session going: context compaction
+
+The Messages API is stateless - every request resends the *entire*
+`messages` list (see [How the loop actually works](#how-the-loop-actually-works))
+- so a long enough session eventually gets too big for the model's context
+window, and every call after that just fails. `main.py` watches for this:
+once the last call's `input_tokens` crosses `CONTEXT_COMPACT_THRESHOLD_TOKENS`
+(defaults to `160000` - 80% of a standard 200K window, leaving headroom for
+the next turn), it replaces everything except the most recent
+`CONTEXT_KEEP_RECENT_TURNS` turns (defaults to `4`) with one short,
+model-written summary, and prints `[context compaction: N older turn(s)
+summarized...]` when it happens.
+
+- **The summary is itself an API call** (`client.messages.create`, no
+  streaming, no tools) - asked to be factual and terse: what was asked,
+  what was done (files touched, commands run and their outcomes), and the
+  current state. It costs real tokens, roughly what one more turn against
+  the *uncompacted* history would have cost - a one-time payment so every
+  call after it is smaller, instead of an ever-growing bill every turn.
+  It's tracked against `SESSION_BUDGET_USD` the same as any other call.
+- **Only ever runs between turns, never mid-turn.** Mid-turn, `messages`
+  can have a tool_use block with no `tool_result` yet - the same "only
+  touch `messages` at a clean boundary" invariant [session persistence](#resuming-a-session)
+  relies on for `--resume`. A single turn that makes so many tool calls it
+  blows the context window on its own isn't caught by this - see
+  [Known limitations](#known-limitations-non-goals-not-oversights).
+- **The kept-verbatim turns are never touched** - compaction only ever
+  replaces the *older* span with a synthetic `user`/`assistant` pair
+  stating the summary and a one-line acknowledgment (needed to keep the
+  message list a valid request - the API requires the first message to be
+  `user`-role and roles to alternate, so the summary can't just be
+  prepended as assistant text). A long enough session compacts more than
+  once; each pass folds the previous summary into a fresh one along with
+  whatever's aged out of the keep-verbatim window since.
+
 ## Measuring accuracy
 
 "Accuracy" doesn't mean what it means for a classifier here - there's no
@@ -660,6 +695,8 @@ see `session_store.py`'s module docstring for why.
 | `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
 | `AUTO_APPROVE_EDITS` | `false` | Skip the y/n prompt before every file write (`create`/`str_replace`/`insert`; `view` never prompts). Kept independent of `AUTO_APPROVE_BASH` - see [Threat model](#threat-model). |
 | `SESSION_BUDGET_USD` | `1.00` | Stop the session once its estimated cost reaches this. `0` disables it. See [Observability](#observability). |
+| `CONTEXT_COMPACT_THRESHOLD_TOKENS` | `160000` | Summarize older turns once the last call's `input_tokens` crosses this. See [Keeping a long session going](#keeping-a-long-session-going-context-compaction). |
+| `CONTEXT_KEEP_RECENT_TURNS` | `4` | How many of the most recent turns compaction always leaves untouched. |
 
 ## Project layout
 
@@ -699,8 +736,12 @@ These are absent because adding them would turn a project meant to be
 readable end-to-end into a second, larger project - not because they were
 missed:
 
-- **No context management.** Long sessions will eventually hit the model's
-  context window with no compaction or trimming strategy in place.
+- **Context compaction only covers between-turn growth, not a single
+  oversized turn.** See [Keeping a long session going](#keeping-a-long-session-going-context-compaction)
+  - a turn that makes so many tool calls it blows the context window on
+  its own isn't caught, the same way the budget guardrail's per-call check
+  can't be applied mid-restructure. Rare in practice (it takes a lot of
+  large tool outputs in one uninterrupted turn), but real.
 - **No MCP client.** This harness only calls the two hardcoded local tools
   - it doesn't speak the Model Context Protocol to reach anything external.
 - **No sub-agents, no parallelism beyond one turn's tool calls.** One

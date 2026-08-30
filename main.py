@@ -101,6 +101,24 @@ SESSION_BUDGET_USD = float(os.environ.get("SESSION_BUDGET_USD", "1.00"))
 session_cost_usd = 0.0
 _warned_unpriced_model = False  # print the "can't track cost" warning once, not every turn
 
+# Context compaction. Every model this harness targets has (at least) a
+# 200K-token context window - 160K (80%) leaves headroom for the next
+# turn's new user message and response before the *actual* hard limit,
+# rather than cutting it exactly at the edge. Override
+# CONTEXT_COMPACT_THRESHOLD_TOKENS if you point CLAUDE_MODEL at something
+# with a materially different window.
+CONTEXT_COMPACT_THRESHOLD_TOKENS = int(os.environ.get("CONTEXT_COMPACT_THRESHOLD_TOKENS", "160000"))
+
+# How many of the most recent complete turns are always kept verbatim,
+# never summarized - so a compaction never blurs away the immediate
+# context a follow-up ("now fix that", "run it again") depends on.
+CONTEXT_KEEP_RECENT_TURNS = int(os.environ.get("CONTEXT_KEEP_RECENT_TURNS", "4"))
+
+# The input_tokens count from the most recent api_call - this is what
+# maybe_compact() checks against CONTEXT_COMPACT_THRESHOLD_TOKENS. Updated
+# by track_api_call() below, alongside session_cost_usd.
+last_input_tokens = 0
+
 
 class BudgetExceeded(Exception):
     """Raised when session_cost_usd crosses SESSION_BUDGET_USD.
@@ -229,6 +247,183 @@ def wrap_untrusted(result: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# API call bookkeeping - shared by the main loop and the context-compaction
+# summarizer below, so every real API call counts toward the same session
+# budget and gets logged the same way regardless of which code path made it.
+# ---------------------------------------------------------------------------
+
+
+def track_api_call(message, trace_id: str, latency_ms: float) -> None:
+    """Log one api_call event and enforce the budget guardrail against it.
+
+    Raises BudgetExceeded the moment the running total crosses
+    SESSION_BUDGET_USD - see that exception's docstring for why that ends
+    the whole session rather than just this call.
+    """
+    global session_cost_usd, _warned_unpriced_model, last_input_tokens
+
+    last_input_tokens = message.usage.input_tokens
+    log_event(
+        "api_call",
+        trace_id,
+        model=message.model,
+        stop_reason=message.stop_reason,
+        latency_ms=latency_ms,
+        input_tokens=message.usage.input_tokens,
+        output_tokens=message.usage.output_tokens,
+        cache_read_input_tokens=message.usage.cache_read_input_tokens,
+    )
+
+    call_cost = estimate_cost_usd(
+        message.model, message.usage.input_tokens, message.usage.output_tokens, message.usage.cache_read_input_tokens
+    )
+    if call_cost is None:
+        if SESSION_BUDGET_USD > 0 and not _warned_unpriced_model:
+            print(f"[no pricing data for {message.model} - the session budget can't track this call's cost]")
+            _warned_unpriced_model = True
+    else:
+        session_cost_usd += call_cost
+        if SESSION_BUDGET_USD > 0 and session_cost_usd >= SESSION_BUDGET_USD:
+            raise BudgetExceeded(
+                f"session cost ${session_cost_usd:.4f} has reached the ${SESSION_BUDGET_USD:.2f} "
+                f"session budget (SESSION_BUDGET_USD in .env) - stopping now, before running "
+                f"anything else."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Context compaction
+# ---------------------------------------------------------------------------
+# Every request resends the entire `messages` list - the Messages API is
+# stateless (see the module docstring near `messages` above) - so a long
+# enough session eventually gets too big for the model's context window and
+# every call after that just fails. The fix here is the standard one: once
+# the last call's input_tokens crosses a threshold, replace everything
+# except the most recent few turns with one short, model-written summary.
+#
+# This can only safely happen between turns, not mid-turn. Mid-turn,
+# `messages` can have a tool_use block with no tool_result yet (we're still
+# running it) - the same invariant session_store.py relies on for --resume
+# (see its docstring): only ever touch `messages` at a point where every
+# tool_use already has its matching tool_result. So maybe_compact() is only
+# ever called from the top of run_turn(), before the new user message is
+# appended - never from inside the tool-calling while loop. A single turn
+# that makes so many tool calls it blows the context window on its own
+# won't be caught by this; that's a known, deliberate limitation - see the
+# README's Known limitations.
+
+
+def compute_turn_boundaries(msgs: list[dict]) -> list[int]:
+    """Indices into `msgs` where each real user task begins.
+
+    A genuine new task is always appended by run_turn() as a bare string
+    (`messages.append({"role": "user", "content": user_input})`); a
+    tool-results continuation of a turn already in progress is always a
+    list of tool_result blocks. That shape difference is enough to tell
+    them apart without tracking turn boundaries as separate state -  which
+    matters because it means this works identically whether `messages` was
+    built up live or reloaded via --resume from a session saved before
+    compaction existed.
+    """
+    return [i for i, m in enumerate(msgs) if m["role"] == "user" and isinstance(m["content"], str)]
+
+
+def _summarize_older_messages(older: list[dict], trace_id: str) -> str:
+    """One extra, non-streamed API call whose only job is to compress
+    `older` down to a short, factual recap.
+
+    This costs real tokens too - `older` is exactly the history that's
+    gotten too big, so summarizing it costs roughly what one more turn
+    against the *uncompacted* history would have cost anyway. It's a
+    one-time payment: every call from here on is smaller, instead of
+    paying an ever-growing input_tokens bill on every single turn.
+    """
+    summary_request = older + [
+        {
+            "role": "user",
+            "content": (
+                "Summarize this coding session so far: what was asked, what you did "
+                "(files created or edited, commands run and their outcomes), and the "
+                "current state of the project. Be factual and terse - include only what "
+                "matters for continuing this task correctly, since this summary will "
+                "replace the full history above."
+            ),
+        }
+    ]
+    with timer() as api_timer:
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system="You are compacting an ongoing coding session's history into a short, "
+            "factual summary for context management. Output only the summary - no "
+            "preamble, no chit-chat.",
+            messages=summary_request,
+            # No `tools` here on purpose - this call only ever produces text.
+        )
+    track_api_call(message, trace_id, api_timer.ms)
+    return "".join(block.text for block in message.content if block.type == "text").strip()
+
+
+def maybe_compact(trace_id: str) -> None:
+    """Summarize older turns into one short note if the last known context
+    size has crossed CONTEXT_COMPACT_THRESHOLD_TOKENS. See the module
+    section comment above for why this only ever runs between turns."""
+    global messages
+
+    if last_input_tokens < CONTEXT_COMPACT_THRESHOLD_TOKENS:
+        return
+
+    # Captured now, before _summarize_older_messages() below makes its own
+    # API call - that call runs through track_api_call() too, the same as
+    # any other, which overwrites the module-level last_input_tokens with
+    # *its own* (much smaller) input size. Logging that instead of the
+    # value that actually triggered this compaction would be misleading -
+    # caught by actually reading a real logged event, not assumed correct.
+    triggering_input_tokens = last_input_tokens
+
+    boundaries = compute_turn_boundaries(messages)
+    if len(boundaries) <= CONTEXT_KEEP_RECENT_TURNS:
+        return  # not enough turns yet to leave anything meaningful uncompacted
+
+    cut_at = boundaries[-CONTEXT_KEEP_RECENT_TURNS]  # keep this turn onward, verbatim
+    older, recent = messages[:cut_at], messages[cut_at:]
+    turns_summarized = len(boundaries) - CONTEXT_KEEP_RECENT_TURNS
+
+    summary = _summarize_older_messages(older, trace_id)
+
+    # The synthetic pair below - not just the summary alone - exists to
+    # keep `messages` a valid request: the API requires the first message
+    # to have role "user" and roles to alternate, so a lone assistant-role
+    # summary couldn't lead the list, and the summary can't just be
+    # prepended as extra user-role text without mutating `recent` (which is
+    # meant to stay untouched, verbatim). A user message stating the
+    # summary, "acknowledged" by a synthetic assistant reply, keeps the
+    # shape valid and reads naturally as a recap the model can act on.
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "(Continuing this coding session - here is a summary of everything that "
+                "happened before this point; the full history was compacted to save "
+                f"context space:)\n\n{summary}"
+            ),
+        },
+        {"role": "assistant", "content": "Understood - I have that context. Continuing from here."},
+    ] + recent
+
+    print(f"\n[context compaction: {turns_summarized} older turn(s) summarized to keep the session going]")
+    log_event(
+        "context_compaction",
+        trace_id,
+        turns_summarized=turns_summarized,
+        messages_before=len(older) + len(recent),
+        messages_after=len(messages),
+        last_input_tokens=triggering_input_tokens,
+        summary_preview=preview(summary),
+    )
+
+
+# ---------------------------------------------------------------------------
 # The agentic loop
 # ---------------------------------------------------------------------------
 
@@ -241,7 +436,9 @@ def run_turn(trace_id: str, user_input: str) -> None:
     tool call, the summary at the end - together in logs/events.jsonl. See
     observability.py and the README's Observability section.
     """
-    global session_cost_usd, _warned_unpriced_model, completed_turns
+    global completed_turns
+
+    maybe_compact(trace_id)  # only ever safe here - see its module comment
 
     messages.append({"role": "user", "content": user_input})
     log_event("turn_start", trace_id, user_input=preview(user_input))
@@ -269,43 +466,13 @@ def run_turn(trace_id: str, user_input: str) -> None:
                 message = stream.get_final_message()
             print()
 
-            # message.usage carries token counts for this one API call -
-            # the raw numbers behind whatever "cost of this turn" you'd
-            # want to compute. See the README's Observability section.
-            log_event(
-                "api_call",
-                trace_id,
-                model=message.model,
-                stop_reason=message.stop_reason,
-                latency_ms=api_timer.ms,
-                input_tokens=message.usage.input_tokens,
-                output_tokens=message.usage.output_tokens,
-                cache_read_input_tokens=message.usage.cache_read_input_tokens,
-            )
-
-            # The budget guardrail: tally this call's cost and stop before
-            # running anything else - another API call or the tool calls
-            # Claude just asked for - the moment the running total reaches
-            # the cap. Checked here, not just between turns, so one very
-            # long tool-calling turn can't blow past it unnoticed.
-            call_cost = estimate_cost_usd(
-                message.model,
-                message.usage.input_tokens,
-                message.usage.output_tokens,
-                message.usage.cache_read_input_tokens,
-            )
-            if call_cost is None:
-                if SESSION_BUDGET_USD > 0 and not _warned_unpriced_model:
-                    print(f"[no pricing data for {message.model} - the session budget can't track this call's cost]")
-                    _warned_unpriced_model = True
-            else:
-                session_cost_usd += call_cost
-                if SESSION_BUDGET_USD > 0 and session_cost_usd >= SESSION_BUDGET_USD:
-                    raise BudgetExceeded(
-                        f"session cost ${session_cost_usd:.4f} has reached the ${SESSION_BUDGET_USD:.2f} "
-                        f"session budget (SESSION_BUDGET_USD in .env) - stopping now, before running "
-                        f"anything else."
-                    )
+            # message.usage carries token counts for this one API call - the
+            # raw numbers behind cost tracking, the budget guardrail (checked
+            # here, not just between turns, so one very long tool-calling
+            # turn can't blow past it unnoticed), and - via last_input_tokens
+            # - context compaction's own trigger. See the README's
+            # Observability section and track_api_call() above.
+            track_api_call(message, trace_id, api_timer.ms)
 
             if message.stop_reason == "pause_turn":
                 # A server-side tool hit an internal continuation point. This
