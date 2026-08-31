@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 from tools import TOOLS, handle_bash, handle_text_editor
 from observability import new_trace_id, log_event, preview, timer, SESSION_ID
 from pricing import estimate_cost_usd
+import mcp_client
 import session_store
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ class BudgetExceeded(Exception):
 ROOT = Path.cwd().resolve()
 
 SYSTEM_PROMPT = f"""You are a basic coding assistant running as a local CLI harness.
-You have two tools: bash (runs shell commands) and a text editor (view/create/str_replace/insert).
+You have two built-in tools: bash (runs shell commands) and a text editor (view/create/str_replace/insert).
 Every file operation is confined to the project root: {ROOT}
 Every bash command requires the user's interactive y/n approval before it runs - if declined, adapt your plan instead of repeating the same command.
 Be direct and concise. When a task is done, stop and summarize what changed instead of continuing to poke around.
@@ -184,6 +185,8 @@ def execute_tool(name: str, tool_input: dict) -> str:
         return handle_bash(tool_input, ROOT)
     if name == "str_replace_based_edit_tool":
         return handle_text_editor(tool_input, ROOT)
+    if mcp_client.is_mcp_tool(name):
+        return mcp_client.call_tool(name, tool_input)
     return f'Error: unknown tool "{name}"'
 
 
@@ -512,12 +515,15 @@ def run_turn(trace_id: str, user_input: str) -> None:
                     call=preview(describe_call(block.name, block.input), 120),
                     duration_ms=tool_timer.ms,
                     # A heuristic, not a guarantee: our own tool handlers
-                    # only ever start a failure or a decline with "Error",
-                    # or one of the two fixed decline strings (bash and the
-                    # text editor's create/str_replace/insert gate) - see
-                    # tools.py. Good enough to spot a rough success rate at
-                    # a glance; don't treat it as a verified pass/fail signal.
-                    looks_successful=not result.startswith(("Error", "Command declined", "Edit declined")),
+                    # only ever start a failure or a decline with "Error", or
+                    # one of the three fixed decline strings (bash and the
+                    # text editor's create/str_replace/insert gate, both in
+                    # tools.py; MCP calls, in mcp_client.py). Good enough to
+                    # spot a rough success rate at a glance; don't treat it
+                    # as a verified pass/fail signal.
+                    looks_successful=not result.startswith(
+                        ("Error", "Command declined", "Edit declined", "MCP call declined")
+                    ),
                     result_preview=preview(result),
                 )
                 tool_results.append(
@@ -595,6 +601,8 @@ def resume_session(requested_id: str) -> None:
 
 
 def main() -> None:
+    global TOOLS, SYSTEM_PROMPT
+
     if ARGS.list:
         print_sessions()
         return
@@ -602,45 +610,68 @@ def main() -> None:
     if ARGS.resume:
         resume_session(ARGS.resume)
 
+    # Connect to any MCP servers configured in mcp_servers.json before the
+    # first request - see mcp_client.py's module docstring. A no-op (empty
+    # list, nothing printed) when that file doesn't exist: MCP support is
+    # opt-in. Extending TOOLS and SYSTEM_PROMPT here, once, up front (rather
+    # than per turn) matches how MODEL/MAX_TOKENS/etc. are already resolved
+    # once at startup, not re-read every loop iteration.
+    mcp_tool_defs = mcp_client.connect_all()
+    if mcp_tool_defs:
+        TOOLS = TOOLS + mcp_tool_defs
+        tool_names = ", ".join(t["name"] for t in mcp_tool_defs)
+        SYSTEM_PROMPT += (
+            f"\n\nYou also have {len(mcp_tool_defs)} additional tool(s) from connected MCP "
+            f"servers: {tool_names}. These go through the same kind of interactive y/n "
+            f"approval as bash before they run."
+        )
+
     budget_line = f"${SESSION_BUDGET_USD:.2f}" if SESSION_BUDGET_USD > 0 else "none (disabled)"
     print(f"coding-agent-cli - basic coding harness ({MODEL})")
     print(f"project root: {ROOT}")
     print(f"session budget: {budget_line} (SESSION_BUDGET_USD in .env - 0 disables it)")
     print('type a task, or "exit" to quit\n')
 
-    while True:
-        try:
-            user_input = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break  # Ctrl+D or Ctrl+C at the prompt - just exit quietly
+    try:
+        while True:
+            try:
+                user_input = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break  # Ctrl+D or Ctrl+C at the prompt - just exit quietly
 
-        if not user_input:
-            continue
-        if user_input in ("exit", "quit"):
-            break
+            if not user_input:
+                continue
+            if user_input in ("exit", "quit"):
+                break
 
-        # One trace_id per turn, generated here (not inside run_turn) so
-        # it's still available in the except block below if run_turn
-        # raises before logging anything itself.
-        trace_id = new_trace_id()
-        try:
-            run_turn(trace_id, user_input)
-        except BudgetExceeded as err:
-            print(f"\n{err}")
-            log_event("error", trace_id, kind="budget_exceeded", session_cost_usd=round(session_cost_usd, 4))
-            break  # end the session outright, not just this turn - see BudgetExceeded's docstring
-        except KeyboardInterrupt:
-            print("\n(interrupted)")
-            log_event("error", trace_id, kind="interrupted")
-        except anthropic.AuthenticationError:
-            print("Authentication failed - check ANTHROPIC_API_KEY in .env.")
-            log_event("error", trace_id, kind="authentication_error")
-        except anthropic.RateLimitError:
-            print("Rate limited - wait a moment and try again.")
-            log_event("error", trace_id, kind="rate_limit_error")
-        except anthropic.APIError as err:
-            print(f"API error: {err}")
-            log_event("error", trace_id, kind="api_error", message=preview(str(err)))
+            # One trace_id per turn, generated here (not inside run_turn) so
+            # it's still available in the except block below if run_turn
+            # raises before logging anything itself.
+            trace_id = new_trace_id()
+            try:
+                run_turn(trace_id, user_input)
+            except BudgetExceeded as err:
+                print(f"\n{err}")
+                log_event("error", trace_id, kind="budget_exceeded", session_cost_usd=round(session_cost_usd, 4))
+                break  # end the session outright, not just this turn - see BudgetExceeded's docstring
+            except KeyboardInterrupt:
+                print("\n(interrupted)")
+                log_event("error", trace_id, kind="interrupted")
+            except anthropic.AuthenticationError:
+                print("Authentication failed - check ANTHROPIC_API_KEY in .env.")
+                log_event("error", trace_id, kind="authentication_error")
+            except anthropic.RateLimitError:
+                print("Rate limited - wait a moment and try again.")
+                log_event("error", trace_id, kind="rate_limit_error")
+            except anthropic.APIError as err:
+                print(f"API error: {err}")
+                log_event("error", trace_id, kind="api_error", message=preview(str(err)))
+    finally:
+        # try/finally (not just a call after the loop) so a connected MCP
+        # server's subprocess still gets torn down even if something above
+        # raises past all the except clauses - an orphaned child process is
+        # a worse outcome than a slightly-defensive-looking finally block.
+        mcp_client.shutdown()
 
 
 if __name__ == "__main__":

@@ -4,9 +4,14 @@
 # repo (see the "Measuring accuracy" and "Known limitations" sections of
 # README.md):
 #
-#   unit-tests  - tests/test_tools.py against tools.py's functions directly.
-#                 Stdlib only, no API key, no network, seconds to run - so
-#                 it runs automatically on every push and pull request.
+#   unit-tests  - tests/*.py against tools.py, cost_report.py, and
+#                 mcp_client.py's functions directly. No API key, no
+#                 network, no live model, seconds to run - so it runs
+#                 automatically on every push and pull request. Needs
+#                 requirements.txt installed (unlike when this job was
+#                 tools.py-only, tests/test_mcp_client.py imports the mcp
+#                 package to mock it) - still free and fast, just no
+#                 longer literally zero dependencies.
 #
 #   evals       - evals/run_evals.py, the golden-task harness. Spawns a
 #                 real `python main.py` subprocess and makes real Anthropic
@@ -28,17 +33,15 @@ on:
 
 jobs:
   unit-tests:
-    name: Unit tests (tools.py, in isolation)
+    name: Unit tests (tools.py, cost_report.py, mcp_client.py, in isolation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # No `pip install` step here on purpose - tools.py and
-      # tests/test_tools.py only import the standard library, so this job
-      # doesn't need requirements.txt (anthropic, python-dotenv) at all.
-      - name: Run tests/test_tools.py
+      - run: pip install -r requirements.txt
+      - name: Run tests/
         run: python -m unittest discover -s tests -t . -v
 
   evals:

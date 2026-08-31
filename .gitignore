@@ -9,3 +9,4 @@ logs/
 evals/history.jsonl
 evals/report.html
 sessions/
+mcp_servers.json

@@ -56,8 +56,10 @@ flowchart TD
         Dispatch{"which tool?"}
         Bash["handle_bash()\ntools.py"]
         Editor["handle_text_editor()\ntools.py"]
+        MCPClient["mcp_client.call_tool()\nmcp_client.py"]
         Shell[("subprocess.run\ncwd = project root")]
         FS[("pathlib read/write\nproject root only")]
+        MCPServer[("spawned MCP server\nprocess, via stdio")]
         Logs[("logs/events.jsonl")]
         Sessions[("sessions/{id}.json")]
     end
@@ -71,17 +73,20 @@ flowchart TD
     API -->|"stop_reason: tool_use"| Dispatch
     Dispatch -->|"bash"| Bash
     Dispatch -->|"str_replace_based_edit_tool"| Editor
+    Dispatch -->|"{server}__{tool}"| MCPClient
     Bash -->|"① y/n approval gate"| Shell
     Editor -->|"② path confinement check"| FS
+    MCPClient -->|"③ y/n approval gate"| MCPServer
     Shell -->|"tool_result"| REPL
     FS -->|"tool_result"| REPL
+    MCPServer -->|"tool_result"| REPL
     REPL -->|"loop until stop_reason: end_turn"| API
     API -->|"stop_reason: end_turn"| U
     REPL -.->|"structured events"| Logs
     REPL <-.->|"--resume reads / saves after each turn"| Sessions
 
     classDef guarded fill:#4d2d00,stroke:#d29922,color:#ffe7b3,stroke-width:2px
-    class Bash,Editor guarded
+    class Bash,Editor,MCPClient guarded
 ```
 
 Reading it:
@@ -89,13 +94,15 @@ Reading it:
 - **The box around each half is the trust boundary**, not just visual
   grouping - it's the same "your repos vs. the model's servers" split the
   [Threat model](#threat-model) section is built around.
-- **The two highlighted nodes (① ②) are the ones with a safety check in
-  front of them** - `handle_bash` behind the approval prompt,
-  `handle_text_editor` behind the path-confinement check. Every other node
-  runs unconditionally.
+- **The three highlighted nodes (① ② ③) are the ones with a safety check
+  in front of them** - `handle_bash` behind the approval prompt,
+  `handle_text_editor` behind the path-confinement check,
+  `mcp_client.call_tool()` behind its own approval prompt (see
+  [MCP client support](#mcp-client-support)). Every other node runs
+  unconditionally.
 - **Cylinders are external resources being touched** (your shell, your
-  filesystem); rectangles are pure code; the diamond is the one branch
-  point in the whole system.
+  filesystem, a spawned MCP server's own process); rectangles are pure
+  code; the diamond is the one branch point in the whole system.
 - GitHub renders this as a pan/zoom-able SVG natively (drag to move, scroll
   or pinch to zoom) - no extra tooling needed to read the detail. Node
   labels deliberately aren't click-through links to the source files:
@@ -109,14 +116,15 @@ Reading it:
   and read back once at startup if you pass `--resume`. See
   [Observability](#observability) and [Resuming a session](#resuming-a-session).
 
-The loop itself is still just two files - everything else in the repo
+The loop itself is still just three files - everything else in the repo
 (observability, persistence, the reports) sits *around* this core, not
 inside it:
 
 | File | Responsibility |
 |---|---|
 | [`main.py`](./main.py) | The REPL and the agentic loop itself: streams a response, inspects `stop_reason`, dispatches `tool_use` blocks, feeds `tool_result`s back, repeats. |
-| [`tools.py`](./tools.py) | Everything that actually touches your machine: the bash executor, the text-editor command handlers, and the path-confinement logic that gates both. |
+| [`tools.py`](./tools.py) | Everything that actually touches your machine via the two *built-in* tools: the bash executor, the text-editor command handlers, and the path-confinement logic that gates both. |
+| [`mcp_client.py`](./mcp_client.py) | The real MCP client: connects to configured servers, lists their tools, dispatches calls to them - and the sync/async bridge that makes that possible from `main.py`'s synchronous loop. See [MCP client support](#mcp-client-support). |
 
 No planner, no vector index, no sub-agents. The conversation list *is*
 the state - `session_store.py` just means it isn't *only* in memory
@@ -191,25 +199,27 @@ handling beyond the tool-use path:
 
 ## Tools this harness supports
 
-Just two - both **Anthropic-defined tools**, not custom ones with a
-hand-written JSON Schema. That's the first design decision worth
-explaining:
+Two **built-in** tools, both **Anthropic-defined**, not custom ones with a
+hand-written JSON Schema - plus, since [MCP client support](#mcp-client-support)
+was added, however many more tools whatever MCP servers you configure
+bring along. Three decisions worth explaining:
 
-- **Why Anthropic-defined, not custom-schema.** `bash_20250124` and
-  `text_editor_20250728` are schema-less - the tool definition is just
-  `{"type": ..., "name": ...}`, no `input_schema` at all, because the model
-  already knows the input shape from training.
-- **Why *these specific* two, and not more.** They're the minimum pair
-  needed to make "read code, run code, edit code" possible at all. A
+- **Why the built-ins are Anthropic-defined, not custom-schema.**
+  `bash_20250124` and `text_editor_20250728` are schema-less - the tool
+  definition is just `{"type": ..., "name": ...}`, no `input_schema` at
+  all, because the model already knows the input shape from training.
+- **Why bash and the text editor stay the only *built-in* tools.** A
   narrower custom tool (`run_tests`, `git_commit`, `lint_file`) would just
-  be shell in a smaller costume; a broader one (an MCP client, a
-  `git_commit` tool with its own message-formatting rules) is scope creep
-  for a project whose stated goal is *understand the loop*, not *cover
-  every workflow*. See [Known limitations](#known-limitations-non-goals-not-oversights).
-- **Why it matters that they're the *same* tools Claude Code exposes.**
-  Claude has substantially more real-world practice with exactly these two
-  tool shapes than with an equivalent custom one - measurably better
-  behavior for free, not just less code to write.
+  be shell in a smaller costume - `bash` already covers it, and a
+  hand-rolled wrapper around it would just be more code with the same
+  ceiling. This is a separate question from whether the harness can reach
+  *external* tools at all - see [MCP client support](#mcp-client-support)
+  for that, including why an earlier version of this README called an MCP
+  client "scope creep" and what changed.
+- **Why it matters that the built-ins are the *same* tools Claude Code
+  exposes.** Claude has substantially more real-world practice with
+  exactly these two tool shapes than with an equivalent custom one -
+  measurably better behavior for free, not just less code to write.
 
 ### `bash` (`bash_20250124`)
 
@@ -245,6 +255,71 @@ explaining:
   `y` before it writes - `view` is read-only and never prompts (see
   [Threat model](#threat-model)).
 
+## MCP client support
+
+This harness is a real MCP client - it spawns the local MCP servers you
+configure, lists their tools, and calls them directly, the same role
+Claude Code and Claude Desktop play. That's a different thing from
+**Anthropic's own server-side MCP connector** (`mcp_servers` +
+`mcp_toolset`, beta): there, Anthropic's servers connect to a *remote,
+URL-reachable* MCP server on your behalf, and results just show up in the
+API response - no local process, no new dependency, but also not *this
+harness* speaking MCP. This project picked the local-client path instead,
+on purpose: implementing a real MCP client is another mechanism worth
+understanding hands-on, the same reasoning that put a manual agentic loop
+here instead of the Tool Runner. (An earlier version of this README called
+an MCP client "scope creep" for this project - that was the wrong call in
+hindsight, once framed as "a mechanism to understand" rather than "a
+workflow feature to bolt on"; see `WORKLOG.md` for the full reasoning.)
+
+- **Configuration:** [`mcp_servers.json`](./mcp_servers.example.json)
+  (gitignored - see `mcp_servers.example.json` for the shape, same pattern
+  as `.env`/`.env.example`), using the same `mcpServers` map shape Claude
+  Desktop's own config file uses:
+  ```json
+  {
+    "mcpServers": {
+      "filesystem": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"]
+      }
+    }
+  }
+  ```
+  No config file means no MCP servers - MCP support is entirely opt-in,
+  the harness works exactly as before without one.
+- **Local, stdio-only, by design.** Each configured server is spawned as a
+  local subprocess speaking MCP over stdio - the same transport Claude
+  Desktop's stdio servers use. Remote/HTTP/SSE MCP servers, OAuth-protected
+  servers, and MCP resources/prompts (as opposed to tools) aren't
+  supported - see [Known limitations](#known-limitations-non-goals-not-oversights).
+- **Tool names are namespaced** `{server}__{tool}` (e.g. `filesystem__read_file`)
+  so two servers can't collide on a tool name - `mcp_client.py`'s
+  `is_mcp_tool()` uses the same separator to route a `tool_use` block back
+  to the right server.
+- **The guardrail:** every MCP tool call is printed and requires an
+  explicit `y` before it runs - the same shape as the bash and text-editor
+  gates, but its own `AUTO_APPROVE_MCP` switch (see [Threat model](#threat-model)):
+  a configured MCP server is arbitrary third-party code you chose to run,
+  a different trust decision than either built-in tool.
+- **The sync/async bridge.** The `mcp` package is asyncio-only; `main.py`'s
+  loop is a plain synchronous REPL, deliberately (see its own module
+  docstring). Rewriting the loop to `async def` for one feature would
+  touch every function in the file, so `mcp_client.py` instead runs a
+  single background thread with its own event loop for the life of the
+  process - every function it exposes to `main.py` is a normal blocking
+  call. Connections are opened once (not reconnected per tool call, which
+  would mean re-spawning the server subprocess on every single call) and
+  closed on exit, `try`/`finally`-wrapped so a crash doesn't orphan the
+  spawned processes.
+- **A real dependency, found to be a moving target.** The `mcp` package
+  had moved to a new major version (2.x) with real breaking changes -
+  `FastMCP` renamed to `MCPServer`, a simpler `mcp.Client` context-manager
+  API replacing the older manual `stdio_client()` + `ClientSession()`
+  two-step - since this project's last check of the ecosystem. Verified by
+  actually installing it and introspecting the real API rather than
+  trusting a recalled shape; see `WORKLOG.md`.
+
 ## Threat model
 
 The model generates commands and file paths; this process is what actually
@@ -274,6 +349,11 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   separate trust decisions. `view` is read-only and never prompts -
   gating it too would make the tool useless for the model's normal
   look-before-you-edit habit, for no safety benefit (`view` can't write).
+- *Unattended MCP tool calls* → every call to a [configured MCP server](#mcp-client-support)
+  is printed and requires an explicit `y`, the same shape again, gated by
+  its own `AUTO_APPROVE_MCP` - a configured MCP server is arbitrary
+  third-party code you chose to run, a separate trust decision from either
+  built-in tool.
 
 **Partially mitigated**
 - *Prompt injection via tool output.* A file the model reads, or a
@@ -299,6 +379,20 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   prompt injection as an open, industry-wide problem for exactly this
   reason - this mitigation raises the bar against the lazy version of the
   attack, it doesn't close the problem.
+- **MCP tool *results* go through the same wrapper - MCP tool
+  *descriptions* don't.** `mcp_client.call_tool()`'s return value flows
+  through `execute_tool()` into the exact same `wrap_untrusted()` call
+  every other tool result does, no MCP-specific branch needed. Tool
+  *descriptions*, though, are sent as part of the `tools` array a
+  connected server reports at `list_tools()` time - not as message
+  content - so they're never wrapped at all. A malicious or compromised
+  MCP server could write an injection payload straight into a tool's
+  `description` field, which the model reads as ordinary context on every
+  single turn from then on. This is a real, currently unmitigated gap,
+  specific to configuring an MCP server (the two built-in tools' - fixed,
+  literal - descriptions have no such exposure): only connect to MCP
+  servers you trust the same way you'd trust code you `pip install` or
+  `npm install`.
 
 **Not mitigated - on purpose**
 - *No command allowlist.* Blocking pipes, `&&`, backticks, or arbitrary
@@ -313,11 +407,18 @@ executes them. That's the entire risk surface. In bullets, not paragraphs:
   on purpose - you might reasonably trust an agent to rewrite files in a
   repo you're actively supervising while still wanting to eyeball every
   shell command it runs, or vice versa.
+- *`AUTO_APPROVE_MCP=true` removes the MCP gate the same way* - a third,
+  independent switch for a third, independent trust decision.
 - *No sandboxing.* No container, no VM, no seccomp profile. `bash` runs
   with your real user's permissions in your real shell environment. Path
   confinement only covers the *editor* tool - an approved bash command can
   still run `rm -rf ../something`, because that's a completely ordinary
-  shell command from bash's point of view.
+  shell command from bash's point of view. A connected MCP server's
+  subprocess runs with those same permissions too - `mcp_servers.json` is
+  itself a code-execution config by construction (it names a `command` to
+  spawn), the same way flipping `AUTO_APPROVE_BASH` on is trusting
+  yourself with unattended shell access - only point it at servers you'd
+  run any other third-party code from.
 - *Tool output now gets written to a second place.* Since [Observability](#observability)
   was added, a truncated preview of every tool result - which can include
   real file contents or command output - is written to `logs/events.jsonl`
@@ -592,9 +693,9 @@ Two suites, two very different costs, so they're wired up differently in
 
 | | [`tests/`](./tests) | [`evals/run_evals.py`](./evals/run_evals.py) |
 |---|---|---|
-| What it checks | `tools.py` and `cost_report.py`'s functions, called directly | The whole CLI, end to end, via a real model |
-| Needs | Nothing - stdlib `unittest` only | `ANTHROPIC_API_KEY`, real API calls |
-| Cost | Free, ~0.1s | Real money and time |
+| What it checks | `tools.py`, `cost_report.py`, and `mcp_client.py`'s functions, called directly (the real `mcp.Client` is mocked out) | The whole CLI, end to end, via a real model |
+| Needs | `pip install -r requirements.txt`, no API key or network | `ANTHROPIC_API_KEY`, real API calls |
+| Cost | Free, well under a second | Real money and time |
 | Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
 | Run locally | `python -m unittest discover -s tests` | `python evals/run_evals.py` |
 
@@ -716,6 +817,7 @@ see `session_store.py`'s module docstring for why.
 | `MAX_TOKENS` | `8192` | Per-response token ceiling. Raised responses cost more and take longer to stream; lowered ones risk mid-thought truncation (the CLI will tell you when this happens). |
 | `AUTO_APPROVE_BASH` | `false` | Skip the y/n prompt before every bash command. See [Threat model](#threat-model) before touching this. |
 | `AUTO_APPROVE_EDITS` | `false` | Skip the y/n prompt before every file write (`create`/`str_replace`/`insert`; `view` never prompts). Kept independent of `AUTO_APPROVE_BASH` - see [Threat model](#threat-model). |
+| `AUTO_APPROVE_MCP` | `false` | Skip the y/n prompt before every MCP tool call. Kept independent of the other two `AUTO_APPROVE_*` switches - see [MCP client support](#mcp-client-support). |
 | `SESSION_BUDGET_USD` | `1.00` | Stop the session once its estimated cost reaches this. `0` disables it. See [Observability](#observability). |
 | `CONTEXT_COMPACT_THRESHOLD_TOKENS` | `160000` | Summarize older turns once the last call's `input_tokens` crosses this. See [Keeping a long session going](#keeping-a-long-session-going-context-compaction). |
 | `CONTEXT_KEEP_RECENT_TURNS` | `4` | How many of the most recent turns compaction always leaves untouched. |
@@ -726,6 +828,8 @@ see `session_store.py`'s module docstring for why.
 coding-agent-cli/
 ├── main.py                          # REPL + the agentic loop
 ├── tools.py                         # bash + text-editor handlers, path confinement
+├── mcp_client.py                     # real MCP client - connect/list/call, sync<->async bridge
+├── mcp_servers.example.json          # mcp_servers.json's shape (gitignored - see MCP client support)
 ├── observability.py                 # structured JSONL event logging (see Observability)
 ├── session_store.py                 # sessions/<id>.json save + load (see Resuming a session)
 ├── session_report.py                # logs/events.jsonl -> a per-turn token/cost report
@@ -738,7 +842,8 @@ coding-agent-cli/
 │   └── history.jsonl                 # gitignored - one line per run_evals.py run
 ├── tests/
 │   ├── test_tools.py                 # unit tests for tools.py's functions, in isolation
-│   └── test_cost_report.py           # unit tests for cost_report.py, in isolation
+│   ├── test_cost_report.py           # unit tests for cost_report.py, in isolation
+│   └── test_mcp_client.py            # unit tests for mcp_client.py, in isolation (mcp.Client mocked)
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                     # unit tests on every push; evals, manual only (see Tests and CI)
@@ -766,8 +871,11 @@ missed:
   its own isn't caught, the same way the budget guardrail's per-call check
   can't be applied mid-restructure. Rare in practice (it takes a lot of
   large tool outputs in one uninterrupted turn), but real.
-- **No MCP client.** This harness only calls the two hardcoded local tools
-  - it doesn't speak the Model Context Protocol to reach anything external.
+- **MCP client support covers local stdio servers and tools only.** See
+  [MCP client support](#mcp-client-support) for what's implemented. Not
+  covered: remote/HTTP/SSE MCP servers, OAuth-protected servers, and MCP
+  resources/prompts (as opposed to tools) - all real MCP capabilities this
+  harness doesn't reach.
 - **No sub-agents, no parallelism beyond one turn's tool calls.** One
   conversation, one model, one thread of control.
 

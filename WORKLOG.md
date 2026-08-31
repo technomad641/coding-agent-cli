@@ -6,6 +6,148 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-08-31 - MCP client support
+
+- Closes the last backlog item, and the biggest one: this harness is now
+  a real MCP client - it spawns the local MCP servers you configure,
+  lists their tools, and dispatches `tool_use` calls to them directly,
+  the same role Claude Code and Claude Desktop play. This reverses a
+  judgment call this same README made earlier: `git log` shows an older
+  version of the "Tools this harness supports" section calling an MCP
+  client "scope creep" for this project. Revisited on request, and the
+  honest updated framing (now in the README): implementing a real MCP
+  client is *itself* a mechanism worth understanding hands-on, exactly
+  the same reasoning that put a hand-rolled agentic loop here instead of
+  the Tool Runner - it stopped being scope creep once framed as "a
+  mechanism to understand" rather than "a workflow feature to bolt on."
+- **Two architectures exist for "MCP support" and they're genuinely
+  different things** - discussed with the user before writing any code:
+  (A) this harness becomes a real MCP client itself (what got built), vs.
+  (B) Anthropic's server-side MCP connector (`mcp_servers` + `mcp_toolset`,
+  beta) where Anthropic's own servers connect to a *remote* MCP server on
+  your behalf and results just show up in the API response - no local
+  process, no new dependency, but also not *this harness* speaking MCP.
+  (A) was chosen: bigger lift (new dependency, an async boundary to
+  bridge), but matches both the README's own existing framing of the gap
+  and the project's whole ethos.
+- **Training data on the `mcp` package was stale - verified for real
+  before writing a line of the bridge.** `pip index versions mcp` showed
+  2.1.1 current, a major-version jump from the 1.x shape recalled from
+  training. Installed it and introspected the real API rather than
+  guessing: `FastMCP` was renamed to `MCPServer` (`from
+  mcp.server.mcpserver import MCPServer`), and a new high-level
+  `mcp.Client` async-context-manager class replaces the older manual
+  `stdio_client()` + `ClientSession()` two-step. Confirmed the whole
+  connect -> list_tools -> call_tool flow against a real, throwaway
+  two-tool MCP test server (`add`, `echo`) before writing `mcp_client.py`
+  for real - not just from reading signatures.
+- **`mcp_client.py`** is the sync/async bridge: the `mcp` package is
+  asyncio-only (connecting, listing tools, calling a tool are all
+  coroutines); `main.py`'s loop is a plain synchronous REPL, deliberately
+  (see its own module docstring) - rewriting it to `async def` for one
+  feature would touch every function in the file. So a single background
+  daemon thread runs its own event loop for the life of the process, and
+  every function `mcp_client.py` exposes (`connect_all()`, `call_tool()`,
+  `is_mcp_tool()`, `shutdown()`) is a normal blocking function built on
+  `asyncio.run_coroutine_threadsafe(...).result()`. Each configured
+  server's `mcp.Client` connection is opened once at startup and kept
+  alive for the process's lifetime (not reconnected per call, which would
+  mean re-spawning the server subprocess on every single tool call) -
+  its async context manager is entered and exited manually rather than
+  inside one `async with` block, specifically so the connection can
+  outlive any single coroutine.
+- **Configuration**: `mcp_servers.json` (gitignored - see
+  `mcp_servers.example.json`), using the exact same `mcpServers` map
+  shape (`command`/`args`/`env`) Claude Desktop's own config file uses,
+  so an existing config mostly just works here too. Opt-in by design - no
+  file means no MCP servers, not a broken harness. Degrades gracefully at
+  every failure point rather than crashing the whole CLI at startup: a
+  missing file returns no servers, malformed JSON prints a warning and
+  returns no servers (this one was a real gap caught before it ever
+  shipped - the original code let a `json.JSONDecodeError` propagate
+  straight out of `main()`), and one server that fails to start is
+  skipped with a warning while the rest still connect.
+- **Tool names are namespaced** `{server}__{tool}` so two servers can't
+  collide on a tool name - each MCP tool's `input_schema` is passed
+  through to Anthropic exactly as the server reports it (already JSON
+  Schema, the same shape a hand-written custom Anthropic tool needs).
+- **The approval gate lives in `mcp_client.py`, not `main.py`** -
+  `_confirm_call()` sits right next to `call_tool()`, the same place
+  `tools.py` keeps `_confirm_bash()`/`_confirm_edit()` next to the
+  handlers they gate, rather than centralizing approval logic in the
+  dispatcher. Its own `AUTO_APPROVE_MCP` switch, independent of
+  `AUTO_APPROVE_BASH`/`AUTO_APPROVE_EDITS` - a configured MCP server is
+  arbitrary third-party code you chose to run, a separate trust decision
+  from either built-in tool.
+- **Verified in four stages, the same discipline as every other
+  behavior-changing feature in this project:**
+  1. A real, live round trip against a genuinely spawned test MCP server
+     (before writing `mcp_client.py` at all, to pin down the real API).
+  2. Mocked-`mcp.Client` unit tests (`tests/test_mcp_client.py`, 18
+     tests) for config loading (missing file, malformed JSON, valid
+     config), namespacing/dispatch, and the approval gate's three paths
+     (decline/approve/auto-approve) - fast, free, no subprocess spawned.
+  3. **Real, live, end-to-end**: `python main.py` (Haiku, throwaway dir,
+     a real spawned two-tool test server) with a task that required the
+     model to discover and call an MCP tool through the real approval
+     gate. Verified all three paths for real: declining left the result
+     unseen and the model correctly didn't retry; approving returned the
+     server's real computed result and the model used it correctly;
+     `AUTO_APPROVE_MCP=true` skipped the prompt and ran straight through.
+     Confirmed via `pgrep` that the spawned server subprocess is actually
+     gone after the process exits cleanly - not orphaned.
+  4. Confirmed `--list` (a code path that never touches MCP) still exits
+     promptly - the background thread starts unconditionally at import
+     time but is a daemon thread, so it doesn't block process exit.
+- **That verification caught a real, if low-impact, bug**: the unit test
+  suite (not a synthetic mutation, an actual failure while writing the
+  tests) found that `is_mcp_tool("myserver")` - a bare name with no
+  `__tool` suffix at all - incorrectly returned `True` whenever
+  `"myserver"` happened to be a connected server's name, because the
+  original check only compared the prefix-before-first-separator against
+  connected servers without confirming the separator was actually
+  present. The model can never actually produce such a name (it was never
+  offered as a real tool name in `tools=[...]`), and the failure mode was
+  already graceful either way (an "Error: ..." string, not a crash) - but
+  fixed to require the separator, and value of writing tests for a module
+  that's easy to reason about in isolation, demonstrated directly.
+- **New threat-model surface, documented honestly, not left implicit**:
+  MCP tool *results* flow through the exact same `wrap_untrusted()`
+  prompt-injection wrapper every other tool result does (no MCP-specific
+  code needed - `execute_tool()`'s return value is opaque to the
+  wrapper). MCP tool *descriptions*, though, are sent as part of the
+  `tools` array at request time, not as message content, so they're
+  never wrapped - a malicious or compromised MCP server could inject a
+  payload straight into a tool's `description` field, which the model
+  reads as ordinary context on every turn. Called out explicitly in the
+  README's Threat model as a real, currently unmitigated gap specific to
+  configuring an MCP server, rather than silently omitted.
+- **CI**: `tests/test_mcp_client.py` needs the `mcp` package to mock
+  `mcp.Client` against, so the `unit-tests` job in `ci.yml` is no longer
+  literally zero-dependency - it now runs `pip install -r
+  requirements.txt` like the `evals` job always has. Still free, still no
+  API key, still runs on every push - verified by actually running the
+  full suite in a fresh `python3 -m venv` + `pip install` before pushing,
+  the same way the original "no pip install needed" claim was verified
+  when this job was tools.py-only.
+- Added `mcp>=2.0.0` to `requirements.txt`, `mcp_servers.json` to
+  `.gitignore`, `AUTO_APPROVE_MCP` to `.env.example`.
+- Updated README.md extensively: rewrote the "Tools this harness
+  supports" intro (the "scope creep" framing above); added a new "MCP
+  client support" section (config shape, namespacing, the approval gate,
+  the sync/async bridge, the API-drift discovery); Threat model gained a
+  "Mitigated" bullet (the approval gate), an honest addition to
+  "Partially mitigated" (the tool-description injection gap above), and
+  two "Not mitigated - on purpose" bullets (`AUTO_APPROVE_MCP=true`, no
+  sandboxing of a connected server's subprocess); replaced the "No MCP
+  client" Known-limitations bullet with what's actually still out of
+  scope (remote/HTTP/SSE servers, OAuth-protected servers, MCP
+  resources/prompts); added a third guarded node (①②③) to the
+  Architecture flowchart and validated it still parses and renders
+  correctly (`mermaid.parse()` + a real headless-Chromium screenshot, the
+  same pipeline used for every diagram change in this project); updated
+  Configuration, Project layout, and Tests-and-CI to match.
+
 ## 2026-08-30 - Cross-session cost aggregation: `cost_report.py`
 
 - Closes the "No aggregation across sessions" Observability gap:
