@@ -6,6 +6,82 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-09-07 - Reliability testing for the eval harness: `--repeats N`
+
+- Closes the highest-value, cheapest gap in "Measuring accuracy": a
+  single run of `evals/run_evals.py` can't tell "this task reliably
+  works" apart from "it got lucky once" - agentic loops are
+  non-deterministic. `python evals/run_evals.py --repeats N` now runs
+  every task `N` times and reports `pass_count/attempts` per task instead
+  of one PASS/FAIL, plus an overall "how many tasks are fully reliable"
+  accuracy (strict: *every* attempt has to pass, not just one).
+  `--repeats 1` (the default) is byte-for-byte the old behavior - opt-in
+  on purpose, since `N` multiplies real API cost and time by roughly `N`.
+- `run_task_repeated()` wraps the existing single-attempt `run_task()` (
+  unchanged) and summarizes across attempts. Its returned dict
+  deliberately keeps every field *name* from before (`passed`,
+  `tool_calls`, `input_tokens`, `cost_usd`, ...), just generalizing the
+  *meaning* from "this attempt's value" to "summed across every attempt
+  of this task" - `_append_history()`'s existing sum-across-tasks
+  aggregation code needed zero changes to keep working, at any repeat
+  count, because sum-of-sums composes the same way sum-of-values did.
+  The only genuinely new fields are `attempts`, `pass_count`, and
+  `success_rate`.
+- `evals/history.jsonl` gained a `repeats` field per run, and
+  `evals/report.py`'s run-history table gained a matching "Repeats"
+  column plus an explanatory note that only appears once a history file
+  actually mixes repeat counts - accuracy at `1x` ("did it pass") and at
+  `N>1x` ("did it pass *every* time") are answering different questions,
+  and comparing them on the same trend line without saying so would be
+  misleading. `report.py` needed no other changes: it already only reads
+  run-level fields (`accuracy`/`passed`/`total`/`total_cost_usd`/...),
+  never drills into individual task results, so old history entries
+  (written before `--repeats` existed, no `repeats` key at all) keep
+  rendering correctly via `r.get("repeats", 1)`.
+- **Verified in three stages**: (1) the aggregation math against
+  hand-built fake attempts (all-pass, one-failure, total-failure,
+  cost/token summing, `None`-cost staying `None` not becoming `$0`);
+  (2) a synthetic `evals/history.jsonl` mixing an old-style entry (no
+  `repeats` key), a `repeats: 1` entry, and a `repeats: 5` flaky entry,
+  rendered through the real `report.py` and screenshotted - confirmed the
+  old entry defaults to "1x", the math for the flaky run is right, and
+  the mixed-repeats note only shows up when it should; (3) **a real,
+  live run** - `python evals/run_evals.py --repeats 2` against the real
+  CLI on Haiku.
+- **That live run caught a real, standing bug, not a hypothetical one**:
+  3 of the 4 golden tasks failed *both* attempts, deterministically -
+  not flaky, systemically broken. Cause: `evals/run_evals.py`'s
+  `task_env` has set `AUTO_APPROVE_BASH=true` since the harness was
+  written, but was never updated when the file-edit approval gate
+  (`AUTO_APPROVE_EDITS`, see the 2026-08-29 entry) shipped - so every
+  golden task that creates or edits a file has been hitting an
+  unanswered `y/N` prompt and getting silently declined for every commit
+  since. This was latent, not previously visible, because the harness is
+  manual-only and had evidently not been re-run since that gate landed.
+  Fixed by adding `AUTO_APPROVE_EDITS=true` to `task_env` alongside
+  `AUTO_APPROVE_BASH=true`; re-ran for real and confirmed all 4 tasks now
+  pass both attempts (`4/4 fully reliable`). The bad, bug-caused history
+  entry was deleted rather than kept as a real data point (it measured
+  the bug, not the model).
+- `tests/test_run_evals.py` (8 stdlib `unittest` tests, `run_task()`
+  mocked): locks in the exact aggregation logic above, including two
+  tests specifically for the failure shapes this session actually hit -
+  one-failure-among-many (flaky) and every-attempt-fails-the-same-way
+  (systemic, what the real bug looked like). `evals/run_evals.py` has no
+  module-level side effects (unlike `main.py` - its `.env`/API-key check
+  and `argparse` both live inside `main()`), so it's cleanly importable
+  and testable the same way `tools.py`/`cost_report.py`/`mcp_client.py`
+  are. Verified the regression tests actually catch the bug class by
+  reintroducing a plausible variant (`passed` meaning "any attempt
+  passed" instead of "every attempt passed") and confirming the right
+  test failed, then reverting to green. 68 tests total across the suite
+  now (up from 60).
+- Updated README.md's "Measuring accuracy" section: documented
+  `--repeats`, fixed the golden-task description to mention
+  `AUTO_APPROVE_EDITS` (it was already silently required, just
+  undocumented and unset); added the new test file to Project layout and
+  the Tests-and-CI table.
+
 ## 2026-08-31 - MCP client support
 
 - Closes the last backlog item, and the biggest one: this harness is now

@@ -17,15 +17,25 @@ This is one useful signal, not the whole story - see the README's
 "Measuring accuracy" section for the other approaches (tool-call success
 rate, decline rate, LLM-as-judge) this harness does NOT implement, and why.
 
+A single run of each task only tells you "did it work this time" -
+agentic loops are non-deterministic, so one green run can't tell "reliably
+solves this" apart from "got lucky once." --repeats N runs every task N
+times and reports pass_count/attempts per task instead of a single
+PASS/FAIL, plus an overall "how many tasks are fully reliable" accuracy -
+see run_task_repeated() below.
+
 Run it with:
 
-    python evals/run_evals.py
+    python evals/run_evals.py               # each task once (default)
+    python evals/run_evals.py --repeats 5   # each task 5 times - 5x the cost/time of a single run
 
 This makes real API calls and costs real money/time - it is deliberately
 not wired into any CI, the same way the sibling MCP-server project in this
-account treats its one live-API smoke test as manual-only.
+account treats its one live-API smoke test as manual-only. --repeats N
+multiplies that cost by N - budget accordingly before raising it.
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -163,9 +173,15 @@ def run_task(task: dict, env: dict) -> dict:
         # Run the real CLI as a subprocess, cwd pinned to the temp dir - so
         # main.py's own ROOT = Path.cwd() binds to it, exactly like a human
         # running `python main.py` from that folder would. AUTO_APPROVE_BASH
-        # skips the interactive y/n prompt, which would otherwise block
-        # forever with no one there to answer it.
-        task_env = {**env, "AUTO_APPROVE_BASH": "true"}
+        # and AUTO_APPROVE_EDITS skip their interactive y/n prompts, which
+        # would otherwise block forever with no one there to answer them -
+        # any task that creates or edits a file needs the latter too, not
+        # just the former (see WORKLOG.md: this harness silently failed
+        # every file-creating/editing golden task for several commits after
+        # the edit-approval gate shipped, because this line wasn't updated
+        # to match - caught by --repeats making a *deterministic* failure
+        # look exactly like maximal unreliability instead of one bad run).
+        task_env = {**env, "AUTO_APPROVE_BASH": "true", "AUTO_APPROVE_EDITS": "true"}
         stdin_text = task["prompt"] + "\nexit\n"
 
         try:
@@ -202,6 +218,52 @@ def run_task(task: dict, env: dict) -> dict:
             "reason": reason,
             **metrics,
         }
+
+
+def run_task_repeated(task: dict, env: dict, repeats: int) -> dict:
+    """Run one task `repeats` times and summarize reliability across the
+    attempts - the whole point of --repeats (see the module docstring):
+    one green run can't tell "reliably solves this" apart from "got lucky
+    once."
+
+    The returned dict's field *names* are deliberately identical to a
+    single run_task() call's, with their *meaning* generalized from "this
+    attempt's value" to "summed across every attempt of this task" -
+    `_append_history()` below already sums these across tasks to get
+    run-level totals, and sum-of-sums composes the same way sum-of-values
+    did, so that aggregation code needs zero changes to keep working
+    whether repeats is 1 (identical to today's single-run behavior, since
+    summing one value is that value) or more. The only genuinely new
+    fields are `attempts`, `pass_count`, and `success_rate`.
+    """
+    attempts = [run_task(task, env) for _ in range(repeats)]
+    pass_count = sum(1 for a in attempts if a["passed"])
+    costs = [a["cost_usd"] for a in attempts if a["cost_usd"] is not None]
+
+    if pass_count == repeats:
+        reason = "ok"
+    else:
+        failure_reasons = sorted({a["reason"] for a in attempts if not a["passed"]})
+        reason = f"flaky - {repeats - pass_count}/{repeats} failed: " + "; ".join(failure_reasons)
+
+    return {
+        "name": task["name"],
+        "attempts": repeats,
+        "pass_count": pass_count,
+        "success_rate": pass_count / repeats,
+        # "passed" stays a boolean for backward compatibility with history
+        # written before --repeats existed - the strictest reading of it:
+        # every single attempt passed, not just some of them.
+        "passed": pass_count == repeats,
+        "reason": reason,
+        "model": next((a["model"] for a in attempts if a["model"]), None),
+        "tool_calls": sum(a["tool_calls"] for a in attempts),
+        "input_tokens": sum(a["input_tokens"] for a in attempts),
+        "output_tokens": sum(a["output_tokens"] for a in attempts),
+        "cache_read_input_tokens": sum(a["cache_read_input_tokens"] for a in attempts),
+        "duration_ms": round(sum(a["duration_ms"] for a in attempts), 1),
+        "cost_usd": sum(costs) if costs else None,
+    }
 
 
 def _read_metrics(events_path: Path) -> dict:
@@ -245,18 +307,36 @@ def _fmt_cost(v) -> str:
     return f"${v:.4f}" if v is not None else "?"
 
 
-def _append_history(results: list[dict]) -> None:
+def _append_history(results: list[dict], repeats: int) -> None:
     """Append one line to evals/history.jsonl - this is the file
     evals/report.py reads to plot accuracy and cost across runs over time.
-    Never overwritten, only appended to, so old runs stay comparable."""
+    Never overwritten, only appended to, so old runs stay comparable.
+
+    `passed`/`total`/`accuracy` keep their pre---repeats meaning exactly
+    when repeats=1 (a task either passed or it didn't). At repeats>1,
+    `passed` means "every attempt of this task passed" (see
+    run_task_repeated()) - so `accuracy` here is "fraction of tasks that
+    are fully reliable," a stricter and more useful headline number than
+    "fraction of all attempts that happened to pass," and it's what
+    evals/report.py's existing trend chart already plots with no changes
+    needed. `total_attempts`/`total_pass_count` carry the finer-grained
+    pooled-attempts view for anyone reading the raw history who wants it.
+    `repeats` is recorded so a reader of history.jsonl - or
+    evals/report.py's run-history table - can tell a 5x-repeated run's
+    accuracy apart from a single-shot one instead of silently comparing
+    two different things on the same trend line.
+    """
     passed = sum(1 for r in results if r["passed"])
     record = {
         "ts": time.time(),
         "model": next((r["model"] for r in results if r["model"]), None),
+        "repeats": repeats,
         "tasks": results,
         "passed": passed,
         "total": len(results),
         "accuracy": passed / len(results) if results else 0.0,
+        "total_attempts": sum(r["attempts"] for r in results),
+        "total_pass_count": sum(r["pass_count"] for r in results),
         "total_input_tokens": sum(r["input_tokens"] for r in results),
         "total_output_tokens": sum(r["output_tokens"] for r in results),
         "total_cost_usd": sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None,
@@ -268,27 +348,67 @@ def _append_history(results: list[dict]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="run each task this many times and report pass_count/attempts instead of a single PASS/FAIL "
+        "(default 1). Multiplies real API cost and time by roughly this factor.",
+    )
+    args = parser.parse_args()
+    if args.repeats <= 0:
+        parser.error("--repeats must be a positive integer")
+
     load_dotenv(REPO_ROOT / ".env")
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("Missing ANTHROPIC_API_KEY - copy .env.example to .env and set it (see README).")
         sys.exit(1)
 
-    print(f"Running {len(TASKS)} golden tasks against {MAIN_PY} ...\n")
-    results = [run_task(task, dict(os.environ)) for task in TASKS]
+    if args.repeats == 1:
+        print(f"Running {len(TASKS)} golden tasks against {MAIN_PY} ...\n")
+    else:
+        print(
+            f"Running {len(TASKS)} golden tasks x {args.repeats} repeats each "
+            f"({len(TASKS) * args.repeats} total attempts) against {MAIN_PY} - "
+            f"roughly {args.repeats}x the cost/time of a single run.\n"
+        )
 
-    print(f"{'TASK':<18} {'RESULT':<6} {'TOOL CALLS':<11} {'TOKENS (in/out)':<17} {'COST':<9} {'TIME':<8} REASON")
+    results = []
+    for task in TASKS:
+        if args.repeats > 1:
+            print(f"  {task['name']}: ", end="", flush=True)
+        result = run_task_repeated(task, dict(os.environ), args.repeats)
+        if args.repeats > 1:
+            print(f"{result['pass_count']}/{result['attempts']}")
+        results.append(result)
+
+    if args.repeats > 1:
+        print()
+
+    header_result_col = "RESULT" if args.repeats == 1 else "PASS RATE"
+    print(f"{'TASK':<18} {header_result_col:<10} {'TOOL CALLS':<11} {'TOKENS (in/out)':<17} {'COST':<9} {'TIME':<8} REASON")
     for r in results:
-        status = "PASS" if r["passed"] else "FAIL"
+        status = ("PASS" if r["passed"] else "FAIL") if args.repeats == 1 else f"{r['pass_count']}/{r['attempts']}"
         tokens = f"{r['input_tokens']}/{r['output_tokens']}"
         time_s = f"{r['duration_ms'] / 1000:.1f}s"
-        print(f"{r['name']:<18} {status:<6} {r['tool_calls']:<11} {tokens:<17} {_fmt_cost(r['cost_usd']):<9} {time_s:<8} {r['reason']}")
+        print(f"{r['name']:<18} {status:<10} {r['tool_calls']:<11} {tokens:<17} {_fmt_cost(r['cost_usd']):<9} {time_s:<8} {r['reason']}")
 
     passed = sum(1 for r in results if r["passed"])
     total = len(results)
     total_cost = sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None
-    print(f"\naccuracy: {passed}/{total} ({passed / total:.0%})   total cost: {_fmt_cost(total_cost)}")
+    if args.repeats == 1:
+        print(f"\naccuracy: {passed}/{total} ({passed / total:.0%})   total cost: {_fmt_cost(total_cost)}")
+    else:
+        total_attempts = sum(r["attempts"] for r in results)
+        total_pass_count = sum(r["pass_count"] for r in results)
+        print(
+            f"\n{passed}/{total} task(s) fully reliable ({passed / total:.0%}) - "
+            f"{total_pass_count}/{total_attempts} attempts passed overall ({total_pass_count / total_attempts:.0%})"
+            f"   total cost: {_fmt_cost(total_cost)}"
+        )
 
-    _append_history(results)
+    _append_history(results, args.repeats)
     print(f"\nAppended to {HISTORY_PATH.relative_to(REPO_ROOT)} - run `python evals/report.py` to see the trend across runs.")
 
 

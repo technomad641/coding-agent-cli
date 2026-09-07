@@ -85,6 +85,7 @@ def render_report(runs: list[dict]) -> str:
     rows = "".join(
         f"<tr><td>{fmt_time(r['ts'])}</td>"
         f'<td class="mono">{r.get("model") or "—"}</td>'
+        f'<td class="num">{r.get("repeats", 1)}x</td>'
         f'<td class="num">{r["passed"]}/{r["total"]} ({r["accuracy"]:.0%})</td>'
         f'<td class="num">{fmt_cost(r.get("total_cost_usd"))}</td>'
         f'<td class="num">{r.get("total_duration_ms", 0) / 1000:.1f}s</td></tr>'
@@ -92,10 +93,25 @@ def render_report(runs: list[dict]) -> str:
     )
     table = (
         '<div style="overflow-x:auto"><table><thead><tr>'
-        "<th>Run</th><th>Model</th><th>Accuracy</th><th>Cost</th><th>Duration</th>"
+        "<th>Run</th><th>Model</th><th>Repeats</th><th>Accuracy</th><th>Cost</th><th>Duration</th>"
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
     )
-    table_section = section("Run history", "newest first", table)
+    table_section = section(
+        "Run history",
+        "newest first",
+        table
+        + (
+            '<p style="font-size:12px;color:var(--ink-muted);margin:10px 0 0">'
+            "Accuracy at <b>1x</b> means each task ran once - a pass either happened or "
+            'didn’t. At <b>N&gt;1x</b>, "Accuracy" means the fraction of tasks that '
+            "passed <i>every</i> repeat (see <span class=\"mono\">evals/run_evals.py "
+            "--repeats</span>) - a stricter number than at 1x, so don't compare accuracy "
+            "across rows with different repeat counts as if they measured the same thing."
+            "</p>"
+            if any(r.get("repeats", 1) != 1 for r in runs)
+            else ""
+        ),
+    )
 
     footer = (
         "Costs are estimates from <span class=\"mono\">pricing.py</span>'s point-in-time "

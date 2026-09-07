@@ -622,10 +622,13 @@ which is more useful than pretending there's a single number:
   `bash` append - each with a known-correct end state.
 - Each task runs against the *real* CLI, as an actual `python main.py`
   subprocess (not internals imported and called directly), in its own
-  throwaway temp directory, with `AUTO_APPROVE_BASH=true` so it can run
-  unattended. The result gets checked against the exact expected file
-  state, and the run's own `logs/events.jsonl` gets read back for the
-  tool-call count, token usage, and duration shown in the report.
+  throwaway temp directory, with `AUTO_APPROVE_BASH=true` and
+  `AUTO_APPROVE_EDITS=true` so it can run unattended - both, since a task
+  can create or edit a file just as easily as it runs a command, and each
+  gate is independent (see [Threat model](#threat-model)). The result gets
+  checked against the exact expected file state, and the run's own
+  `logs/events.jsonl` gets read back for the tool-call count, token usage,
+  and duration shown in the report.
 - Run it: `python evals/run_evals.py`. It needs a real `ANTHROPIC_API_KEY`
   and makes several real API calls - it costs actual money and time, which
   is why its [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) job
@@ -637,9 +640,22 @@ which is more useful than pretending there's a single number:
   and only as good as the 4 tasks it happens to check - extending it means
   writing another `check()` function in that file, not touching the
   harness itself.
+- **`--repeats N` measures reliability, not just one-shot success.** A
+  single green run can't tell "this task reliably works" apart from "it
+  got lucky once" - agentic loops are non-deterministic. `python
+  evals/run_evals.py --repeats 5` runs every task 5 times and reports
+  `pass_count/attempts` per task instead of a single PASS/FAIL, plus an
+  overall "how many tasks are fully reliable" accuracy (all `N` attempts
+  passed, not just some). Multiplies real cost and time by roughly `N` -
+  it's opt-in (`--repeats 1` is the default, identical to the old
+  behavior) for exactly that reason.
 - Every run also appends one line to `evals/history.jsonl` (accuracy,
-  per-task results, token totals, estimated cost) - it's never overwritten,
-  so runs stay comparable across changes to the harness.
+  `repeats`, per-task results, token totals, estimated cost) - it's never
+  overwritten, so runs stay comparable across changes to the harness. A
+  run's `repeats` count is recorded specifically so a 5x-repeated run's
+  stricter accuracy is never silently compared to a single-shot run's as
+  if they measured the same thing - see `evals/report.py`'s run-history
+  table.
 
 **Implemented: the trend across runs ([`evals/report.py`](./evals/report.py))**
 - Reads `evals/history.jsonl` and renders `evals/report.html`: latest
@@ -693,7 +709,7 @@ Two suites, two very different costs, so they're wired up differently in
 
 | | [`tests/`](./tests) | [`evals/run_evals.py`](./evals/run_evals.py) |
 |---|---|---|
-| What it checks | `tools.py`, `cost_report.py`, and `mcp_client.py`'s functions, called directly (the real `mcp.Client` is mocked out) | The whole CLI, end to end, via a real model |
+| What it checks | `tools.py`, `cost_report.py`, `mcp_client.py`, and `evals/run_evals.py`'s functions, called directly (the real `mcp.Client` and `run_task()` are mocked out) | The whole CLI, end to end, via a real model |
 | Needs | `pip install -r requirements.txt`, no API key or network | `ANTHROPIC_API_KEY`, real API calls |
 | Cost | Free, well under a second | Real money and time |
 | Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
@@ -843,7 +859,8 @@ coding-agent-cli/
 ├── tests/
 │   ├── test_tools.py                 # unit tests for tools.py's functions, in isolation
 │   ├── test_cost_report.py           # unit tests for cost_report.py, in isolation
-│   └── test_mcp_client.py            # unit tests for mcp_client.py, in isolation (mcp.Client mocked)
+│   ├── test_mcp_client.py            # unit tests for mcp_client.py, in isolation (mcp.Client mocked)
+│   └── test_run_evals.py             # unit tests for run_evals.py's reliability aggregation (run_task() mocked)
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                     # unit tests on every push; evals, manual only (see Tests and CI)
