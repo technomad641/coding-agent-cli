@@ -6,6 +6,97 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-09-18 - Comparative model runs: `--models` across Haiku/Sonnet/Opus
+
+- **The gap this closes.** `run_evals.py` could answer "how good is the
+  agent?" for one model. It couldn't answer the question that actually
+  drives a decision: "is the cheap model good enough for *this* work?"
+  That's a question about a comparison, and there was no way to get one
+  except running the harness by hand with a different `CLAUDE_MODEL` and
+  eyeballing two terminal scrollbacks.
+- `python evals/run_evals.py --models a,b,c` runs the identical task set,
+  with the identical `check()` functions, once per model and prints a
+  side-by-side table of accuracy / tokens / cost / wall time.
+  Composes with `--repeats`.
+- **Deliberately structured as N ordinary runs plus a summary**, not as a
+  new kind of run: each model still writes its own `history.jsonl` line
+  through the same `_append_history()`. That's what kept `evals/report.py`
+  working without knowing anything about comparison runs, and it's why
+  the new per-model view below was a small addition rather than a rewrite.
+- **`requested_model` is now recorded alongside `model`.** They are two
+  different facts: `model` is what the API reported serving (read back out
+  of the run's own event log), `requested_model` is what `--models` asked
+  for. The live run proved this is not hypothetical - requesting
+  `claude-haiku-4-5` got `claude-haiku-4-5-20251001` served. Grouping a
+  comparison on the served id would split one model's history in two the
+  day the snapshot behind an alias rolls. The stdout table prints a note
+  whenever the two differ, rather than silently showing one and meaning
+  the other.
+- **`evals/report.py` gained a Model comparison section**, shown only once
+  history holds more than one model. It uses each model's *most recent*
+  run rather than an average: runs from different days were measured
+  against different agent code, so averaging them would compare things
+  that aren't comparable. And once several models share one history file
+  the trend charts above stop being a trend - a dip may just be a cheaper
+  model's turn - so they now say exactly that. Same honesty problem the
+  Repeats column solved, same fix: separate what isn't comparable instead
+  of averaging it.
+- **The comparison names no winner, on purpose.** Four tasks is far too
+  thin a sample to crown a model on, and which tradeoff is right depends
+  on what you're optimizing for. The table informs; it doesn't decide.
+
+### What the first real run actually showed
+
+Live, all four golden tasks, one pass per model (~$0.23 total):
+
+| model | accuracy | tool calls | tokens (in/out) | cost | time |
+|---|---|---|---|---|---|
+| claude-haiku-4-5 | 4/4 | 11 | 31099/1467 | $0.0384 | 16.1s |
+| claude-sonnet-5 | 4/4 | 6 | 22268/829 | $0.0528 | 16.2s |
+| claude-opus-5 | 4/4 | 6 | 21744/1102 | $0.1363 | 21.8s |
+
+- **Every model scored 100%, which is a finding about the tasks, not the
+  models.** These 4 tasks were deliberately picked to have one checkable
+  end state; that simplicity is what makes them deterministic, and it's
+  also what makes them unable to separate three models at the top. A
+  benchmark everything passes has no resolving power. Recording this
+  plainly in the README rather than presenting a 3-way tie as a result -
+  the honest next step is harder tasks, not a louder claim about these.
+- The tasks *do* separate the models on efficiency: Haiku needed 11 tool
+  calls and ~31k input tokens where Sonnet and Opus each needed 6 and
+  ~22k. Same answer, more loop iterations to get there - which is exactly
+  the signal the README's "tool calls per task" note predicted would
+  matter, now visible.
+
+### Verification
+
+- 95 unit tests green (77 before; +10 in the new `tests/test_eval_report.py`
+  for the per-model grouping, +8 in `tests/test_run_evals.py`).
+- **Mutation-tested all 11 new tests** rather than trusting that they
+  pass. Two found real weaknesses in my own tests:
+  - A header assertion was passing off the repeats>1 *footnote* (which
+    also contains the word "RELIABLE") instead of the header, so a
+    mutation pinning the header to "ACCURACY" survived. Fixed to assert
+    on the header row specifically - and the first fix picked the "MODEL
+    COMPARISON" banner, which also starts with "MODEL", making every
+    assertion vacuously true. Caught because the strengthened test then
+    failed against correct code.
+  - Nothing asserted the repeats footnote is *absent* at 1x, where it
+    would read "all 1 attempts passed".
+- **A methodology bug worth recording: stale `__pycache__` silently
+  faked two mutation results.** Mutating and restoring a file within the
+  same second leaves its `.pyc` valid (Python invalidates on mtime+size
+  at 1-second resolution, and the mutations were size-neutral), so one
+  mutation's test run reported the *previous* mutation's failures. Re-ran
+  the whole matrix with `PYTHONDONTWRITEBYTECODE=1`. Worth knowing for any
+  future mutation testing in this repo: without it, mutation testing can
+  report exactly the reassuring answer you were hoping for.
+- Live-verified end to end: the 3-model run above, then `evals/report.py`
+  regenerated and the rendered HTML checked in a headless browser -
+  Model comparison section present with three bars, the mixed-model
+  caveat on the trend charts, and the Run history table showing
+  `claude-haiku-4-5` (requested) rather than the snapshot id.
+
 ## 2026-09-18 - Refreshed `pricing.py` against live docs, and a snapshot-id fix
 
 - Checked every rate in `pricing.py` against Anthropic's pricing page

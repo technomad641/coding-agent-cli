@@ -654,18 +654,54 @@ which is more useful than pretending there's a single number:
   passed, not just some). Multiplies real cost and time by roughly `N` -
   it's opt-in (`--repeats 1` is the default, identical to the old
   behavior) for exactly that reason.
+- **`--models a,b,c` runs the same task set against several models.** An
+  accuracy number for one model is only interesting next to another's:
+  "is the cheap model good enough for this?" is a question about a
+  comparison, not about a single run. `python evals/run_evals.py --models
+  claude-haiku-4-5,claude-sonnet-5,claude-opus-5` runs the whole suite
+  once per model - identical tasks, identical `check()` functions - and
+  prints a side-by-side table of accuracy, tokens, cost and wall time.
+  Each model still gets its own `history.jsonl` line, so this is N
+  ordinary runs plus a summary, not a new kind of run. Combines with
+  `--repeats` (and multiplies cost by both).
+- **What that comparison actually showed here, which is worth stating
+  plainly:** all three models scored 4/4. The tasks separate them on
+  *cost* (Haiku $0.038, Sonnet $0.053, Opus $0.136 per pass) and on
+  *efficiency* (Haiku needed 11 tool calls and ~31k input tokens to
+  Sonnet's and Opus's 6 calls and ~22k), but not on accuracy at all -
+  which is a fact about these 4 deliberately-simple tasks, not a finding
+  about the models. A benchmark that everything passes has no resolving
+  power at the top; the honest next step is harder tasks, not a louder
+  claim about these ones.
+- The comparison table deliberately reports the numbers and names no
+  winner. Which tradeoff is right depends on what you're optimizing for,
+  and four tasks is far too thin a sample to crown a model on.
 - Every run also appends one line to `evals/history.jsonl` (accuracy,
-  `repeats`, per-task results, token totals, estimated cost) - it's never
-  overwritten, so runs stay comparable across changes to the harness. A
-  run's `repeats` count is recorded specifically so a 5x-repeated run's
-  stricter accuracy is never silently compared to a single-shot run's as
-  if they measured the same thing - see `evals/report.py`'s run-history
-  table.
+  `repeats`, `requested_model`, per-task results, token totals, estimated
+  cost) - it's never overwritten, so runs stay comparable across changes
+  to the harness. A run's `repeats` count is recorded specifically so a
+  5x-repeated run's stricter accuracy is never silently compared to a
+  single-shot run's as if they measured the same thing - see
+  `evals/report.py`'s run-history table. `requested_model` is recorded
+  alongside the served `model` for the same reason: they differ whenever
+  an alias resolves to a dated snapshot (requesting
+  `claude-haiku-4-5` gets `claude-haiku-4-5-20251001` served), and
+  grouping a comparison on the served id would split one model's history
+  in two the day that snapshot rolls.
 
 **Implemented: the trend across runs ([`evals/report.py`](./evals/report.py))**
 - Reads `evals/history.jsonl` and renders `evals/report.html`: latest
   accuracy plus its delta from the previous run, an accuracy-over-runs
-  line chart, a cost-over-runs line chart, and a full run history table.
+  line chart, a cost-over-runs line chart, a per-model comparison, and a
+  full run history table.
+- The **Model comparison** section appears only once history holds more
+  than one model, and shows each model's *most recent* run rather than an
+  average across runs - two models are only comparable when they ran the
+  same tasks against the same agent code, and runs from different days
+  generally didn't. Once `--models` has written several models into one
+  history file the trend charts above it become a timeline rather than a
+  like-for-like trend (a dip may just be a cheaper model's turn), so they
+  say so instead of letting the line be read as a regression.
 - This is the answer to "did my last change make the agent better or
   worse" - a single run's stdout table can tell you *that* run's result,
   not whether it's an improvement.
@@ -714,7 +750,7 @@ Two suites, two very different costs, so they're wired up differently in
 
 | | [`tests/`](./tests) | [`evals/run_evals.py`](./evals/run_evals.py) |
 |---|---|---|
-| What it checks | `tools.py`, `cost_report.py`, `mcp_client.py`, `pricing.py`, and `evals/run_evals.py`'s functions, called directly (the real `mcp.Client` and `run_task()` are mocked out) | The whole CLI, end to end, via a real model |
+| What it checks | `tools.py`, `cost_report.py`, `mcp_client.py`, `pricing.py`, and `evals/run_evals.py`'s + `evals/report.py`'s functions, called directly (the real `mcp.Client` and `run_task()` are mocked out) | The whole CLI, end to end, via a real model |
 | Needs | `pip install -r requirements.txt`, no API key or network | `ANTHROPIC_API_KEY`, real API calls |
 | Cost | Free, well under a second | Real money and time |
 | Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
@@ -858,15 +894,16 @@ coding-agent-cli/
 ├── pricing.py                       # $/token rates, shared by every report
 ├── report_style.py                  # shared HTML/CSS + chart helpers for every report
 ├── evals/
-│   ├── run_evals.py                  # golden-task accuracy harness (see Measuring accuracy)
-│   ├── report.py                     # evals/history.jsonl -> an accuracy/cost trend report
+│   ├── run_evals.py                  # golden-task accuracy harness; --repeats, --models (see Measuring accuracy)
+│   ├── report.py                     # evals/history.jsonl -> an accuracy/cost/per-model report
 │   └── history.jsonl                 # gitignored - one line per run_evals.py run
 ├── tests/
 │   ├── test_tools.py                 # unit tests for tools.py's functions, in isolation
 │   ├── test_cost_report.py           # unit tests for cost_report.py, in isolation
 │   ├── test_mcp_client.py            # unit tests for mcp_client.py, in isolation (mcp.Client mocked)
 │   ├── test_pricing.py               # unit tests for pricing.py's lookup logic (not the rates themselves)
-│   └── test_run_evals.py             # unit tests for run_evals.py's reliability aggregation (run_task() mocked)
+│   ├── test_run_evals.py             # unit tests for run_evals.py's reliability + model-comparison bookkeeping (run_task() mocked)
+│   └── test_eval_report.py           # unit tests for evals/report.py's per-model grouping
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                     # unit tests on every push; evals, manual only (see Tests and CI)

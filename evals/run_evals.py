@@ -24,15 +24,25 @@ times and reports pass_count/attempts per task instead of a single
 PASS/FAIL, plus an overall "how many tasks are fully reliable" accuracy -
 see run_task_repeated() below.
 
+The same reasoning applies across models, not just across attempts: an
+accuracy number for one model is only interesting next to another one's.
+--models runs the identical task set, with the identical checks, once per
+model and prints them side by side - so "is the cheap model good enough
+for this?" becomes a number instead of a hunch. See
+_print_model_comparison() below for why it deliberately reports the
+numbers and declines to name a winner.
+
 Run it with:
 
     python evals/run_evals.py               # each task once (default)
     python evals/run_evals.py --repeats 5   # each task 5 times - 5x the cost/time of a single run
+    python evals/run_evals.py --models claude-haiku-4-5,claude-sonnet-5,claude-opus-5
 
 This makes real API calls and costs real money/time - it is deliberately
 not wired into any CI, the same way the sibling MCP-server project in this
 account treats its one live-API smoke test as manual-only. --repeats N
-multiplies that cost by N - budget accordingly before raising it.
+multiplies that cost by N, --models multiplies it by the number of models,
+and the two multiply together - budget accordingly before raising either.
 """
 
 import argparse
@@ -307,7 +317,7 @@ def _fmt_cost(v) -> str:
     return f"${v:.4f}" if v is not None else "?"
 
 
-def _append_history(results: list[dict], repeats: int) -> None:
+def _append_history(results: list[dict], repeats: int, requested_model: str | None = None) -> None:
     """Append one line to evals/history.jsonl - this is the file
     evals/report.py reads to plot accuracy and cost across runs over time.
     Never overwritten, only appended to, so old runs stay comparable.
@@ -325,11 +335,22 @@ def _append_history(results: list[dict], repeats: int) -> None:
     evals/report.py's run-history table - can tell a 5x-repeated run's
     accuracy apart from a single-shot one instead of silently comparing
     two different things on the same trend line.
+
+    `requested_model` is recorded for the same reason, and answers a
+    question `model` alone cannot: `model` is the model the API actually
+    served, read back out of the run's own event log, while
+    `requested_model` is what --models asked for. They usually match, but
+    a fallback or an alias makes them differ - and when they do, a
+    comparison table that grouped only on the served id would silently
+    merge two arms of the experiment. It stays None for a plain run where
+    nothing was requested, which is also what every history line written
+    before --models existed reads as.
     """
     passed = sum(1 for r in results if r["passed"])
     record = {
         "ts": time.time(),
         "model": next((r["model"] for r in results if r["model"]), None),
+        "requested_model": requested_model,
         "repeats": repeats,
         "tasks": results,
         "passed": passed,
@@ -347,57 +368,40 @@ def _append_history(results: list[dict], repeats: int) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=1,
-        help="run each task this many times and report pass_count/attempts instead of a single PASS/FAIL "
-        "(default 1). Multiplies real API cost and time by roughly this factor.",
-    )
-    args = parser.parse_args()
-    if args.repeats <= 0:
-        parser.error("--repeats must be a positive integer")
-
-    load_dotenv(REPO_ROOT / ".env")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Missing ANTHROPIC_API_KEY - copy .env.example to .env and set it (see README).")
-        sys.exit(1)
-
-    if args.repeats == 1:
-        print(f"Running {len(TASKS)} golden tasks against {MAIN_PY} ...\n")
-    else:
-        print(
-            f"Running {len(TASKS)} golden tasks x {args.repeats} repeats each "
-            f"({len(TASKS) * args.repeats} total attempts) against {MAIN_PY} - "
-            f"roughly {args.repeats}x the cost/time of a single run.\n"
-        )
-
+def run_suite(env: dict, repeats: int) -> list[dict]:
+    """Run every golden task against one model configuration, printing
+    per-task progress as it goes (each attempt can take up to
+    TASK_TIMEOUT_SECONDS, so a multi-repeat or multi-model run would
+    otherwise look hung). Returns the per-task summaries - the same shape
+    _append_history() consumes."""
     results = []
     for task in TASKS:
-        if args.repeats > 1:
+        if repeats > 1:
             print(f"  {task['name']}: ", end="", flush=True)
-        result = run_task_repeated(task, dict(os.environ), args.repeats)
-        if args.repeats > 1:
+        result = run_task_repeated(task, env, repeats)
+        if repeats > 1:
             print(f"{result['pass_count']}/{result['attempts']}")
         results.append(result)
-
-    if args.repeats > 1:
+    if repeats > 1:
         print()
+    return results
 
-    header_result_col = "RESULT" if args.repeats == 1 else "PASS RATE"
+
+def _print_task_table(results: list[dict], repeats: int) -> None:
+    header_result_col = "RESULT" if repeats == 1 else "PASS RATE"
     print(f"{'TASK':<18} {header_result_col:<10} {'TOOL CALLS':<11} {'TOKENS (in/out)':<17} {'COST':<9} {'TIME':<8} REASON")
     for r in results:
-        status = ("PASS" if r["passed"] else "FAIL") if args.repeats == 1 else f"{r['pass_count']}/{r['attempts']}"
+        status = ("PASS" if r["passed"] else "FAIL") if repeats == 1 else f"{r['pass_count']}/{r['attempts']}"
         tokens = f"{r['input_tokens']}/{r['output_tokens']}"
         time_s = f"{r['duration_ms'] / 1000:.1f}s"
         print(f"{r['name']:<18} {status:<10} {r['tool_calls']:<11} {tokens:<17} {_fmt_cost(r['cost_usd']):<9} {time_s:<8} {r['reason']}")
 
+
+def _print_run_summary(results: list[dict], repeats: int) -> None:
     passed = sum(1 for r in results if r["passed"])
     total = len(results)
     total_cost = sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None
-    if args.repeats == 1:
+    if repeats == 1:
         print(f"\naccuracy: {passed}/{total} ({passed / total:.0%})   total cost: {_fmt_cost(total_cost)}")
     else:
         total_attempts = sum(r["attempts"] for r in results)
@@ -408,7 +412,116 @@ def main() -> None:
             f"   total cost: {_fmt_cost(total_cost)}"
         )
 
-    _append_history(results, args.repeats)
+
+def run_and_report(env: dict, repeats: int, requested_model: str | None) -> list[dict]:
+    """One full pass of the task set against one model: run it, print its
+    per-task table and summary line, and append its own history entry.
+
+    Returns the per-task summaries so a caller comparing several models
+    can build a side-by-side table from them - each model still gets its
+    own history line either way, so evals/report.py's per-model view and
+    trend keep working without knowing anything about comparison runs.
+    """
+    results = run_suite(env, repeats)
+    _print_task_table(results, repeats)
+    _print_run_summary(results, repeats)
+    _append_history(results, repeats, requested_model)
+    return results
+
+
+def _print_model_comparison(per_model: list[tuple[str, list[dict]]], repeats: int) -> None:
+    """The whole point of --models: the same task set, same checks, one
+    row per model.
+
+    Deliberately reports the numbers and stops - no "winner", no
+    recommendation. Which tradeoff is right depends on what you're
+    optimizing for, and 4 golden tasks is far too thin a sample to crown
+    a model on anyway (see the README's "Measuring accuracy").
+    """
+    print("\n" + "=" * 78)
+    print("MODEL COMPARISON - same tasks, same checks")
+    print("=" * 78)
+
+    accuracy_header = "ACCURACY" if repeats == 1 else "RELIABLE"
+    print(f"{'MODEL':<30} {accuracy_header:<13} {'TOKENS (in/out)':<19} {'COST':<10} TIME")
+
+    mismatches = []
+    for requested, results in per_model:
+        passed = sum(1 for r in results if r["passed"])
+        total = len(results)
+        tokens = f"{sum(r['input_tokens'] for r in results)}/{sum(r['output_tokens'] for r in results)}"
+        cost = sum(r["cost_usd"] for r in results if r["cost_usd"] is not None) or None
+        time_s = f"{sum(r['duration_ms'] for r in results) / 1000:.1f}s"
+        print(
+            f"{requested:<30} {f'{passed}/{total} ({passed / total:.0%})':<13} "
+            f"{tokens:<19} {_fmt_cost(cost):<10} {time_s}"
+        )
+
+        served = next((r["model"] for r in results if r["model"]), None)
+        if served and served != requested:
+            mismatches.append((requested, served))
+
+    if repeats > 1:
+        print(f"\n(RELIABLE = tasks where all {repeats} attempts passed.)")
+    for requested, served in mismatches:
+        print(f"(note: requested {requested}, API reported {served})")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="run each task this many times and report pass_count/attempts instead of a single PASS/FAIL "
+        "(default 1). Multiplies real API cost and time by roughly this factor.",
+    )
+    parser.add_argument(
+        "--models",
+        help="comma-separated model ids to run the same task set against, e.g. "
+        "claude-haiku-4-5,claude-sonnet-5,claude-opus-5. Runs the whole suite once per model "
+        "and prints a side-by-side comparison at the end; each model also gets its own "
+        "history entry. Default: one run against whatever CLAUDE_MODEL resolves to. "
+        "Multiplies real API cost and time by the number of models.",
+    )
+    args = parser.parse_args()
+    if args.repeats <= 0:
+        parser.error("--repeats must be a positive integer")
+
+    models = None
+    if args.models is not None:
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        if not models:
+            parser.error("--models needs at least one model id")
+
+    load_dotenv(REPO_ROOT / ".env")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Missing ANTHROPIC_API_KEY - copy .env.example to .env and set it (see README).")
+        sys.exit(1)
+
+    attempts_each = f" x {args.repeats} repeats each" if args.repeats > 1 else ""
+    if models is None:
+        total_attempts = len(TASKS) * args.repeats
+        print(f"Running {len(TASKS)} golden tasks{attempts_each} ({total_attempts} attempts) against {MAIN_PY} ...\n")
+        run_and_report(dict(os.environ), args.repeats, os.environ.get("CLAUDE_MODEL"))
+    else:
+        total_attempts = len(TASKS) * args.repeats * len(models)
+        print(
+            f"Running {len(TASKS)} golden tasks{attempts_each} against {len(models)} model(s) "
+            f"({total_attempts} attempts total) - roughly {len(models) * args.repeats}x "
+            f"the cost/time of a single run.\n"
+        )
+        per_model = []
+        for model in models:
+            print(f"--- {model} ---")
+            # CLAUDE_MODEL is what main.py reads to pick its model, and
+            # load_dotenv() there does not override an already-set env var,
+            # so this wins over any CLAUDE_MODEL in .env.
+            results = run_and_report({**os.environ, "CLAUDE_MODEL": model}, args.repeats, model)
+            per_model.append((model, results))
+            print()
+        _print_model_comparison(per_model, args.repeats)
+
     print(f"\nAppended to {HISTORY_PATH.relative_to(REPO_ROOT)} - run `python evals/report.py` to see the trend across runs.")
 
 

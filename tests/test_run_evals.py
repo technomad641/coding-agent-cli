@@ -19,6 +19,8 @@ argparse and the .env/API-key check both happen inside main()), so it's
 safely importable here the same way tools.py and cost_report.py are.
 """
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -171,3 +173,173 @@ class AppendHistoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_records_requested_model_distinct_from_served_model(self):
+        # These are two different facts and the comparison feature depends
+        # on not conflating them: "model" is what the API actually served
+        # (read back out of the run's own event log), "requested_model" is
+        # what --models asked for. A fallback or an alias makes them
+        # differ, and a history reader that only had the served id could
+        # not tell which arm of a comparison a line belonged to.
+        results = [
+            {
+                "name": "a", "attempts": 1, "pass_count": 1, "passed": True, "reason": "ok",
+                "model": "claude-haiku-4-5-20251001", "tool_calls": 1, "input_tokens": 100,
+                "output_tokens": 10, "cache_read_input_tokens": 0, "duration_ms": 10.0, "cost_usd": 0.01,
+            },
+        ]
+        run_evals._append_history(results, repeats=1, requested_model="claude-haiku-4-5")
+        record = self._read_last_record()
+        self.assertEqual(record["requested_model"], "claude-haiku-4-5")
+        self.assertEqual(record["model"], "claude-haiku-4-5-20251001")
+
+    def test_requested_model_defaults_to_none(self):
+        # Every history line written before --models existed has no
+        # requested_model at all, so a plain run must read back the same
+        # way those do rather than inventing a value.
+        results = [
+            {
+                "name": "a", "attempts": 1, "pass_count": 1, "passed": True, "reason": "ok",
+                "model": "m", "tool_calls": 1, "input_tokens": 100, "output_tokens": 10,
+                "cache_read_input_tokens": 0, "duration_ms": 10.0, "cost_usd": 0.01,
+            },
+        ]
+        run_evals._append_history(results, repeats=1)
+        self.assertIsNone(self._read_last_record()["requested_model"])
+
+
+def _task_result(name, passed=True, model="m", input_tokens=100, output_tokens=10, cost_usd=0.001):
+    return {
+        "name": name, "attempts": 1, "pass_count": 1 if passed else 0,
+        "success_rate": 1.0 if passed else 0.0, "passed": passed,
+        "reason": "ok" if passed else "boom", "model": model, "tool_calls": 1,
+        "input_tokens": input_tokens, "output_tokens": output_tokens,
+        "cache_read_input_tokens": 0, "duration_ms": 1000.0, "cost_usd": cost_usd,
+    }
+
+
+class ModelComparisonTests(unittest.TestCase):
+    """Comparative runs (--models). run_task() is mocked out for the same
+    reason as above - these lock in the bookkeeping around the real runs,
+    not the runs themselves."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_history_path = run_evals.HISTORY_PATH
+        run_evals.HISTORY_PATH = Path(self._tmpdir.name) / "history.jsonl"
+
+    def tearDown(self):
+        run_evals.HISTORY_PATH = self._orig_history_path
+        self._tmpdir.cleanup()
+
+    def _capture(self, fn, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = fn(*args)
+        return result, buf.getvalue()
+
+    def test_each_model_gets_its_own_history_line(self):
+        # The design decision this guards: a comparison run is N ordinary
+        # runs plus a summary table, not a new kind of run. That's what
+        # keeps evals/report.py's trend chart working with no changes -
+        # it reads history lines, and it still gets one per model.
+        tasks = [{"name": "t1"}, {"name": "t2"}]
+        with patch.object(run_evals, "TASKS", tasks), \
+                patch.object(run_evals, "run_task", side_effect=lambda t, e: _attempt(True)):
+            for model in ("model-a", "model-b"):
+                self._capture(run_evals.run_and_report, {"CLAUDE_MODEL": model}, 1, model)
+
+        records = [json.loads(line) for line in run_evals.HISTORY_PATH.read_text().splitlines()]
+        self.assertEqual([r["requested_model"] for r in records], ["model-a", "model-b"])
+        self.assertTrue(all(r["total"] == 2 for r in records))
+
+    def test_run_and_report_returns_per_task_results_for_the_table(self):
+        tasks = [{"name": "t1"}, {"name": "t2"}]
+        with patch.object(run_evals, "TASKS", tasks), \
+                patch.object(run_evals, "run_task", side_effect=lambda t, e: _attempt(True)):
+            results, _ = self._capture(run_evals.run_and_report, {}, 1, "model-a")
+        self.assertEqual([r["name"] for r in results], ["t1", "t2"])
+
+    def test_run_suite_passes_the_models_env_through_to_every_task(self):
+        # --models works by overriding CLAUDE_MODEL in the subprocess env.
+        # If run_suite() dropped or rebuilt that env, every "comparison"
+        # would silently be the same model N times - the failure mode that
+        # would make the entire feature quietly meaningless.
+        seen_envs = []
+
+        def _spy(task, env):
+            seen_envs.append(env)
+            return _attempt(True)
+
+        with patch.object(run_evals, "TASKS", [{"name": "t1"}, {"name": "t2"}]), \
+                patch.object(run_evals, "run_task", side_effect=_spy):
+            self._capture(run_evals.run_suite, {"CLAUDE_MODEL": "model-a"}, 1)
+
+        self.assertEqual([e["CLAUDE_MODEL"] for e in seen_envs], ["model-a", "model-a"])
+
+    def test_comparison_table_has_one_row_per_requested_model(self):
+        # Grouped on the *requested* id, not the served one: two aliases
+        # that resolve to the same served model are still two arms of the
+        # experiment and must not collapse into one row.
+        per_model = [
+            ("model-a", [_task_result("t1", passed=True, model="served-x")]),
+            ("model-b", [_task_result("t1", passed=False, model="served-x")]),
+        ]
+        _, out = self._capture(run_evals._print_model_comparison, per_model, 1)
+        self.assertIn("model-a", out)
+        self.assertIn("model-b", out)
+        self.assertIn("1/1 (100%)", out)
+        self.assertIn("0/1 (0%)", out)
+
+    def test_comparison_notes_a_served_model_that_differs_from_the_request(self):
+        per_model = [("claude-haiku-4-5", [_task_result("t1", model="claude-haiku-4-5-20251001")])]
+        _, out = self._capture(run_evals._print_model_comparison, per_model, 1)
+        self.assertIn("note:", out)
+        self.assertIn("claude-haiku-4-5-20251001", out)
+
+    def test_comparison_is_quiet_when_the_served_model_matches(self):
+        per_model = [("model-a", [_task_result("t1", model="model-a")])]
+        _, out = self._capture(run_evals._print_model_comparison, per_model, 1)
+        self.assertNotIn("note:", out)
+
+    def test_comparison_relabels_accuracy_as_reliability_when_repeating(self):
+        # At repeats>1 the column means "tasks where every attempt passed",
+        # which is a stricter claim than "accuracy" - saying so in the
+        # header is the same honesty fix already made for the task table.
+        per_model = [("model-a", [_task_result("t1")])]
+        _, single = self._capture(run_evals._print_model_comparison, per_model, 1)
+        _, repeated = self._capture(run_evals._print_model_comparison, per_model, 5)
+
+        # Assert on the header row itself, not just on the output as a
+        # whole: the repeats>1 footnote also contains the word RELIABLE,
+        # so a loose assertIn over everything passes even when the header
+        # never changes at all. (It did, until this test was mutation-
+        # tested and found to be checking the footnote twice.)
+        def _header(out):
+            # The column header, not the "MODEL COMPARISON" banner above
+            # it - both start with MODEL, and picking the banner would
+            # make every assertion below vacuously true again.
+            return next(line for line in out.splitlines() if "TOKENS" in line)
+
+        self.assertIn("ACCURACY", _header(single))
+        self.assertNotIn("RELIABLE", _header(single))
+        self.assertIn("RELIABLE", _header(repeated))
+        self.assertNotIn("ACCURACY", _header(repeated))
+
+        # The footnote explaining the stricter column, present only where
+        # it applies - at 1x it would read "all 1 attempts passed", which
+        # is noise at best and implies a repeated run at worst.
+        self.assertIn("all 5 attempts passed", repeated)
+        self.assertNotIn("attempts passed", single)
+
+    def test_comparison_reports_numbers_without_crowning_a_winner(self):
+        # Deliberate: 4 golden tasks is far too thin a sample to pick a
+        # model on, and which tradeoff wins depends on what you're
+        # optimizing for. The table informs; it does not decide.
+        per_model = [
+            ("cheap-model", [_task_result("t1", passed=False, cost_usd=0.001)]),
+            ("pricey-model", [_task_result("t1", passed=True, cost_usd=0.10)]),
+        ]
+        _, out = self._capture(run_evals._print_model_comparison, per_model, 1)
+        for verdict in ("winner", "best", "recommend", "worst"):
+            self.assertNotIn(verdict, out.lower())
