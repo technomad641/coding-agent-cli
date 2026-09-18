@@ -545,7 +545,12 @@ and "observability" at production scale:
   dashboards, no alerting, no distributed tracing across processes.
 - No retention policy. The file only grows; nothing rotates or caps it.
 - Pricing is a hardcoded snapshot in `pricing.py`, not a live lookup - see
-  that file's own docstring for what to do when it drifts out of date.
+  that file's own docstring (including two real ways that snapshot had
+  already drifted: a price change that was announced, scheduled, then
+  cancelled, and shipping models missing from the table entirely). Dated
+  snapshot model ids (`claude-haiku-4-5-20251001`) do price correctly -
+  they fall back to their base id - but a genuine rate change still needs
+  a human to notice and edit the table.
 
 ### "$ spent this week": `cost_report.py`
 
@@ -709,7 +714,7 @@ Two suites, two very different costs, so they're wired up differently in
 
 | | [`tests/`](./tests) | [`evals/run_evals.py`](./evals/run_evals.py) |
 |---|---|---|
-| What it checks | `tools.py`, `cost_report.py`, `mcp_client.py`, and `evals/run_evals.py`'s functions, called directly (the real `mcp.Client` and `run_task()` are mocked out) | The whole CLI, end to end, via a real model |
+| What it checks | `tools.py`, `cost_report.py`, `mcp_client.py`, `pricing.py`, and `evals/run_evals.py`'s functions, called directly (the real `mcp.Client` and `run_task()` are mocked out) | The whole CLI, end to end, via a real model |
 | Needs | `pip install -r requirements.txt`, no API key or network | `ANTHROPIC_API_KEY`, real API calls |
 | Cost | Free, well under a second | Real money and time |
 | Runs on | Every push and pull request | Manually only (`workflow_dispatch` from the Actions tab) |
@@ -860,6 +865,7 @@ coding-agent-cli/
 │   ├── test_tools.py                 # unit tests for tools.py's functions, in isolation
 │   ├── test_cost_report.py           # unit tests for cost_report.py, in isolation
 │   ├── test_mcp_client.py            # unit tests for mcp_client.py, in isolation (mcp.Client mocked)
+│   ├── test_pricing.py               # unit tests for pricing.py's lookup logic (not the rates themselves)
 │   └── test_run_evals.py             # unit tests for run_evals.py's reliability aggregation (run_task() mocked)
 ├── .github/
 │   └── workflows/

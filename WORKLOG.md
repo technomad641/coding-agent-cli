@@ -6,6 +6,48 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-09-18 - Refreshed `pricing.py` against live docs, and a snapshot-id fix
+
+- Checked every rate in `pricing.py` against Anthropic's pricing page
+  (the source of truth its own docstring names) before building anything
+  on top of it - the model-comparison work coming next reports *cost* as
+  its headline number, so a stale table would have quietly made that
+  feature wrong rather than merely out of date.
+- **A rate was wrong, not just old**: `claude-sonnet-5` was listed at
+  $3/$15. Anthropic had announced $2/$10 as introductory pricing with an
+  increase to $3/$15 scheduled for 2026-09-01 - that increase was
+  cancelled and $2/$10 became standard. The table had been written from
+  the announcement rather than the outcome, overstating Sonnet 5 by 50%.
+  Fixed to $2/$10.
+- **A real bug, not just a data refresh**: dated snapshot model ids
+  priced as "unknown". The API reports back whichever id the request
+  used, so a run pointed at `claude-haiku-4-5-20251001` logged that id,
+  which wasn't a key in a table written with base ids only - every eval
+  run in this project that used a snapshot id has been showing `?` for
+  cost. (Both live `--repeats` runs in the 2026-09-07 entry show it.)
+  `estimate_cost_usd()` now tries the exact id, then falls back to the id
+  with a trailing `-YYYYMMDD` stripped. Verified against the exact token
+  counts from those runs: all four previously-`?` tasks now price.
+- **Cache-read multiplier is no longer one flat constant.** 0.1x is
+  standard across the lineup, but Fable 5.1 and Mythos 5.1 read cache at
+  0.025x. `CACHE_READ_DISCOUNT` became
+  `DEFAULT_CACHE_READ_MULTIPLIER` + a per-model override map, so adding
+  those two models didn't quietly introduce a 4x error on their cache
+  reads. Nothing outside `pricing.py` imported the old constant, so this
+  restructure was free.
+- Added the shipping models that were missing entirely (Fable 5.1,
+  Mythos 5.1, Mythos 5, Opus 4.5, Sonnet 4.5) - each was rendering as `?`
+  rather than a number. Retired models stay deliberately absent: pointing
+  this harness at one isn't a thing to price, it's a thing to notice, and
+  `None` surfaces it.
+- `tests/test_pricing.py` (9 tests) covers the *logic* around the table -
+  snapshot fallback, exact-match precedence, unknown-is-None-not-zero,
+  `None` model not crashing, the per-model cache multiplier, and cache
+  reads never being double-counted as billable input. Deliberately does
+  not assert specific dollar rates: that would encode the price list
+  twice and turn every genuine price change into a two-place test
+  failure. 77 tests total (up from 68).
+
 ## 2026-09-07 - Reliability testing for the eval harness: `--repeats N`
 
 - Closes the highest-value, cheapest gap in "Measuring accuracy": a
