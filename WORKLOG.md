@@ -6,6 +6,34 @@ worth writing down separately from the commit messages. Newest entries
 first. See [README.md](./README.md) for the current state of the project;
 this file is the history of how it got there.
 
+## 2026-10-04 - Cut the README down; moved the reasoning to docs/DESIGN.md
+
+- The README had grown to 7,625 words across 972 lines - thorough, but no
+  longer something anyone would actually read front to back. Trimmed to
+  1,644 words (-78%), keeping what a reader needs to understand and run
+  the thing: what it is, the architecture diagram, the loop itself, the
+  tools, the safety summary, setup/usage, the config and layout tables,
+  and the limitations.
+- **Moved rather than deleted.** The detailed rationale - why each
+  decision went the way it did, the full threat model, the observability
+  and compaction design notes, the complete "Measuring accuracy"
+  breakdown, the sequence diagram - is now `docs/DESIGN.md` (2,746
+  words). For a learning project the reasoning *is* much of the value;
+  deleting it to hit a word count would have thrown away the part worth
+  keeping. The README links to it twice.
+- **Fixed a stale claim found while trimming**: the opening line said
+  "about 400 lines, most of them comments." `main.py` alone is now 678
+  lines, and the three core files are 1,156 (769 non-comment). The
+  number had been true once and quietly stopped being true as the
+  project grew. Now reads ~1,150 across three files, a third comments.
+- Also trimmed the sibling `github-repo-mcp-server` README (1,539 ->
+  908 words), same approach: keep the reference tables and setup steps
+  verbatim, compress the prose around them.
+- Verified both: every relative link and anchor resolves, both Mermaid
+  blocks are byte-identical to the originals (so they still render on
+  GitHub), and rendered both files to HTML to read them as a reader
+  would rather than trusting the diff.
+
 ## 2026-09-18 - Comparative model runs: `--models` across Haiku/Sonnet/Opus
 
 - **The gap this closes.** `run_evals.py` could answer "how good is the
