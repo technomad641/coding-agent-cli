@@ -139,14 +139,34 @@ gap: [docs/DESIGN.md](./docs/DESIGN.md#threat-model).
 
 ## Setup
 
+Requires Python 3.10+.
+
+**macOS / Linux**
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in ANTHROPIC_API_KEY
+cp .env.example .env            # then fill in ANTHROPIC_API_KEY
 python main.py
 ```
 
-Requires Python 3.10+.
+**Windows (PowerShell)**
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env     # then fill in ANTHROPIC_API_KEY
+python main.py
+```
+
+> **On Windows, run this under WSL or Git Bash.** The CLI itself is
+> portable Python and starts fine in PowerShell, but its `bash` tool shells
+> out through `subprocess.run(shell=True)`, which on Windows is `cmd.exe`.
+> The bash-syntax commands Claude generates (`ls`, `grep`, `cat`, `|`) mostly
+> fail there. Under WSL or Git Bash it behaves exactly as on macOS/Linux.
+> Two of the four golden eval tasks explicitly ask for a bash command, so
+> they're subject to the same caveat.
 
 ## Usage
 
@@ -186,8 +206,8 @@ python main.py --resume <id>      # continue a specific one
 
 Every turn writes structured events to `logs/events.jsonl` — one JSON object
 per line, tagged with a `session_id` and a `trace_id`, so
-`grep <trace_id> logs/events.jsonl` reconstructs a turn with no other
-tooling. Three reports read it back:
+`grep <trace_id> logs/events.jsonl` (`Select-String` on PowerShell)
+reconstructs a turn with no other tooling. Three reports read it back:
 
 ```bash
 python session_report.py          # one run: per-turn tokens, cost, tool outcomes

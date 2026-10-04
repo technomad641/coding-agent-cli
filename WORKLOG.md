@@ -34,6 +34,33 @@ this file is the history of how it got there.
   GitHub), and rendered both files to HTML to read them as a reader
   would rather than trusting the diff.
 
+### Cross-platform install instructions (same day, follow-up)
+
+- The setup block was Unix-only (`source .venv/bin/activate`, `cp`). Added
+  a PowerShell variant alongside it in both repos.
+- **A real limitation surfaced while checking this, not just a command
+  translation.** `handle_bash()` shells out via
+  `subprocess.run(shell=True)`, which on Windows is `cmd.exe`, not bash -
+  so the bash-syntax commands Claude generates (`ls`, `grep`, `cat`,
+  pipes) mostly fail there. The CLI *starts* fine on Windows, which makes
+  this worse, not better: it looks like it works. The README now says to
+  use WSL or Git Bash, and notes that two of the four golden eval tasks
+  explicitly ask for a bash command and carry the same caveat. Documented
+  rather than "fixed" - making the bash tool shell-agnostic is a real
+  piece of work, not a README edit.
+- Verified the documented steps for real rather than asserting them: fresh
+  `git clone` into a temp dir, then ran the README's exact commands -
+  venv, `pip install -r requirements.txt`, `cp .env.example .env`,
+  `python main.py --list` (correct "missing key" message with the
+  placeholder, correct startup with a real one), `python -m unittest
+  discover -s tests` (95 tests, matching the README's claim), and
+  `cost_report.py`'s empty-state message.
+- For `github-repo-mcp-server`, checked the claim instead of assuming it:
+  the lockfile has 72 packages with `os`/`cpu` constraints, all of them
+  esbuild/rolldown/TypeScript prebuilt binaries, all optional, with
+  `win32` variants present. No native compilation, so `npm install` really
+  does work unchanged on Windows.
+
 ## 2026-09-18 - Comparative model runs: `--models` across Haiku/Sonnet/Opus
 
 - **The gap this closes.** `run_evals.py` could answer "how good is the
